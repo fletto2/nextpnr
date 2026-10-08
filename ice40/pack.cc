@@ -330,6 +330,104 @@ static void merge_carry_luts(Context *ctx)
     log_info("    %4d LUTs merged into carry LCs\n", int(packed_cells.size()));
 }
 
+// A carry-only LC still has a free LUT (the carry uses I1/I2 and CIN only), so a DFF-only LC
+// can move into it with the LUT as an I0 pass-through. All DFFs in a logic tile share
+// CLK/CEN/SR/NEG_CLK, so each carry chain only takes DFFs with a single control set.
+static void merge_ffs_into_carries(Context *ctx)
+{
+    log_info("Packing DFFs into carry LCs...\n");
+    typedef std::tuple<NetInfo *, NetInfo *, NetInfo *, bool> CtrlSet;
+    auto ctrl_of = [&](CellInfo *c) {
+        return CtrlSet(c->getPort(id_CLK), c->getPort(id_CEN), c->getPort(id_SR),
+                       bool_or_default(c->params, id_NEG_CLK));
+    };
+    auto is_carry_lc = [&](CellInfo *c) {
+        return c->type == id_ICESTORM_LC && bool_or_default(c->params, id_CARRY_ENABLE);
+    };
+
+    // DFF-only LCs from pack_nonlut_ffs: pass-through LUT on I0 and nothing else
+    std::map<CtrlSet, std::vector<CellInfo *>> ff_pool;
+    for (auto &cell : ctx->cells) {
+        CellInfo *ci = cell.second.get();
+        if (ci->type != id_ICESTORM_LC || !bool_or_default(ci->params, id_DFF_ENABLE) || is_carry_lc(ci))
+            continue;
+        if (int_or_default(ci->params, id_LUT_INIT) != 2 || !ci->getPort(id_I0) || ci->getPort(id_I1) ||
+            ci->getPort(id_I2) || ci->getPort(id_I3) || ci->attrs.count(id_BEL))
+            continue;
+        ff_pool[ctrl_of(ci)].push_back(ci);
+    }
+
+    // Walk each carry chain from its root (CIN not driven by another carry LC)
+    pool<IdString> packed_cells;
+    for (auto &cell : ctx->cells) {
+        CellInfo *root = cell.second.get();
+        if (!is_carry_lc(root))
+            continue;
+        NetInfo *cin = root->getPort(id_CIN);
+        if (cin && cin->driver.cell && is_carry_lc(cin->driver.cell) && cin->driver.port == id_COUT)
+            continue;
+        std::vector<CellInfo *> chain;
+        for (CellInfo *c = root; c != nullptr;) {
+            chain.push_back(c);
+            NetInfo *co = c->getPort(id_COUT);
+            CellInfo *next = nullptr;
+            if (co)
+                for (auto &usr : co->users)
+                    if (usr.port == id_CIN && is_carry_lc(usr.cell))
+                        next = usr.cell;
+            c = next;
+        }
+        // Control set already fixed by DFFs in the chain? Skip chains that already mix sets.
+        bool fixed = false, mixed = false;
+        CtrlSet key;
+        std::vector<CellInfo *> free_lcs;
+        for (CellInfo *c : chain) {
+            if (bool_or_default(c->params, id_DFF_ENABLE)) {
+                if (!fixed) {
+                    key = ctrl_of(c);
+                    fixed = true;
+                } else if (ctrl_of(c) != key) {
+                    mixed = true;
+                }
+            } else if (!c->getPort(id_O) && !c->getPort(id_I0) && !c->getPort(id_I3) && !c->attrs.count(id_BEL)) {
+                free_lcs.push_back(c);
+            }
+        }
+        if (mixed || free_lcs.empty())
+            continue;
+        if (!fixed) { // pick the control set with the most DFFs still waiting
+            size_t best = 0;
+            for (auto &kv : ff_pool)
+                if (kv.second.size() > best) {
+                    best = kv.second.size();
+                    key = kv.first;
+                }
+            if (best == 0)
+                break;
+        }
+        auto &ffs = ff_pool[key];
+        for (CellInfo *lc : free_lcs) {
+            if (ffs.empty())
+                break;
+            CellInfo *ff = ffs.back();
+            ffs.pop_back();
+            ff->movePortTo(id_I0, lc, id_I0);
+            ff->movePortTo(id_O, lc, id_O);
+            ff->movePortTo(id_CLK, lc, id_CLK);
+            ff->movePortTo(id_CEN, lc, id_CEN);
+            ff->movePortTo(id_SR, lc, id_SR);
+            for (IdString p : {id_DFF_ENABLE, id_NEG_CLK, id_ASYNC_SR, id_SET_NORESET})
+                if (ff->params.count(p))
+                    lc->params[p] = ff->params.at(p);
+            lc->params[id_LUT_INIT] = Property(0xAAAA, 16); // O = I0, ignoring the carry inputs on I1/I2
+            packed_cells.insert(ff->name);
+        }
+    }
+    for (auto pcell : packed_cells)
+        ctx->cells.erase(pcell);
+    log_info("    %4d DFFs merged into carry LCs\n", int(packed_cells.size()));
+}
+
 // "Pack" RAMs
 static void pack_ram(Context *ctx)
 {
@@ -1729,6 +1827,8 @@ bool Arch::pack()
         pack_nonlut_ffs(ctx);
         pack_carries(ctx);
         merge_carry_luts(ctx);
+        if (!ctx->setting<bool>("no_ff_carry_merge", false))
+            merge_ffs_into_carries(ctx);
         pack_ram(ctx);
         place_plls(ctx);
         pack_special(ctx);
