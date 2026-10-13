@@ -753,7 +753,27 @@ static void insert_global(Context *ctx, NetInfo *net, bool is_reset, bool is_cen
 
     std::string glb_name = net->name.str(ctx) + std::string("_$glb_") + (is_reset ? "sr" : (is_cen ? "ce" : "clk"));
     std::unique_ptr<CellInfo> gb = create_ice_cell(ctx, id_SB_GB, "$gbuf_" + glb_name);
-    gb->connectPort(id_USER_SIGNAL_TO_GLOBAL_BUFFER, net);
+
+    // A clock straight from an input pad on a global-capable pin takes the pad's own
+    // global buffer, as the vendor tools do, instead of going through the fabric
+    CellInfo *drv = net->driver.cell;
+    bool padin = false;
+    if (!is_reset && !is_cen && !is_logic && drv != nullptr && is_sb_io(ctx, drv) && net->driver.port == id_D_IN_0 &&
+        drv->attrs.count(id_BEL) && (int_or_default(drv->params, id_PIN_TYPE) & 3) == 1) {
+        BelId io_bel = ctx->getBelByNameStr(drv->attrs[id_BEL].as_string());
+        if (io_bel != BelId() && ctx->getBelPinWire(io_bel, id_GLOBAL_BUFFER_OUTPUT) != WireId()) {
+            BelId gb_bel = find_padin_gbuf(ctx, io_bel, id_GLOBAL_BUFFER_OUTPUT);
+            if (gb_bel != BelId()) {
+                gb->attrs[id_FOR_PAD_IN] = Property::State::S1;
+                gb->attrs[id_BEL] = ctx->getBelName(gb_bel).str(ctx);
+                drv->attrs[id_GLOBAL] = Property::State::S1;
+                padin = true;
+                log_info("    using the global buffer of pad %s\n", ctx->nameOf(drv));
+            }
+        }
+    }
+    if (!padin)
+        gb->connectPort(id_USER_SIGNAL_TO_GLOBAL_BUFFER, net);
     NetInfo *glbnet = ctx->createNet(ctx->id(glb_name));
     gb->connectPort(id_GLOBAL_BUFFER_OUTPUT, glbnet);
 
