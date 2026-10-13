@@ -801,6 +801,10 @@ static void promote_globals(Context *ctx)
             }
         }
     }
+    // like the vendor tools, a clock gets a global buffer only from 10 loads up
+    for (auto &it : clock_count)
+        if (it.second < 10)
+            it.second = 0;
     int prom_globals = 0, prom_resets = 0, prom_cens = 0, prom_logics = 0;
     int gbs_available = 8, resets_available = 4, cens_available = 4;
     for (auto &cell : ctx->cells)

@@ -86,6 +86,14 @@ void set_config(const TileInfoPOD &ti, std::vector<std::vector<int8_t>> &tile_cf
     }
 }
 
+static bool has_config(const TileInfoPOD &ti, const std::string &name)
+{
+    for (auto &entry : ti.entries)
+        if (std::string(entry.name.get()) == name)
+            return true;
+    return false;
+}
+
 // Set an IE_{EN,REN} logical bit in a tile config. Logical means enabled.
 // On {HX,LP}1K devices these bits are active low, so we need to invert them.
 void set_ie_bit_logical(const Context *ctx, const TileInfoPOD &ti, std::vector<std::vector<int8_t>> &tile_cfg,
@@ -803,13 +811,33 @@ void write_asc(const Context *ctx, std::ostream &out)
         }
     }
 
+    // UltraPlus: which column buffers (column x, buffer row, network) feed a tile that
+    // takes a global; the vendor tools leave the others off. Each buffer row serves
+    // the rows around it: 4: 0-4, 5: 5-10, 14: 11-14, 15: 15-20, 26: 21-26, 27: 27-31.
+    std::set<std::tuple<int, int, int>> colbuf_used;
+    bool up = ctx->args.type == ArchArgs::UP5K || ctx->args.type == ArchArgs::UP3K;
+    if (up) {
+        for (auto pip : ctx->getPips()) {
+            if (ctx->pip_to_net[pip.index] == nullptr)
+                continue;
+            std::string src = ctx->nameOfWire(ctx->getPipSrcWire(pip));
+            size_t pos = src.find("glb_netwk_");
+            if (pos == std::string::npos)
+                continue;
+            int k = src[pos + 10] - '0';
+            Loc l = ctx->getPipLocation(pip);
+            int row = l.y <= 4 ? 4 : l.y <= 10 ? 5 : l.y <= 14 ? 14 : l.y <= 20 ? 15 : l.y <= 26 ? 26 : 27;
+            colbuf_used.insert(std::make_tuple(l.x, row, k));
+        }
+    }
+
     // Set other config bits
     for (int y = 0; y < ci.height; y++) {
         for (int x = 0; x < ci.width; x++) {
             TileType tile = tile_at(ctx, x, y);
             const TileInfoPOD &ti = bi.tiles_nonrouting[tile];
 
-            // set all ColBufCtrl bits (FIXME)
+            // ColBufCtrl: all buffers, or on UltraPlus only those in use
             bool setColBufCtrl = true;
             if (ctx->args.type == ArchArgs::LP1K || ctx->args.type == ArchArgs::HX1K) {
                 if (tile == TILE_RAMB || tile == TILE_RAMT) {
@@ -828,15 +856,18 @@ void write_asc(const Context *ctx, std::ostream &out)
             } else if (ctx->args.type == ArchArgs::LP384) {
                 setColBufCtrl = false;
             }
-            if (setColBufCtrl) {
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_0", true);
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_1", true);
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_2", true);
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_3", true);
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_4", true);
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_5", true);
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_6", true);
-                set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_7", true);
+            if (up) {
+                // the vendor tools set a network's bit in every tile of each column
+                // buffer's range that the network reaches, not only in the buffer rows
+                int row = y <= 4 ? 4 : y <= 10 ? 5 : y <= 14 ? 14 : y <= 20 ? 15 : y <= 26 ? 26 : 27;
+                for (int k = 0; k < 8; k++) {
+                    std::string name = "ColBufCtrl.glb_netwk_" + std::to_string(k);
+                    if (colbuf_used.count(std::make_tuple(x, row, k)) && has_config(ti, name))
+                        set_config(ti, config.at(y).at(x), name, true);
+                }
+            } else if (setColBufCtrl) {
+                for (int k = 0; k < 8; k++)
+                    set_config(ti, config.at(y).at(x), "ColBufCtrl.glb_netwk_" + std::to_string(k), true);
             }
 
             // Weird UltraPlus bits
