@@ -166,9 +166,14 @@ bool Arch::isBelLocationValid(BelId bel, bool explain_invalid) const
                 // - OUTPUT_CLK
                 // - INPUT_CLK
                 if (compCell) {
+                    // an input register nobody reads (e.g. the unused input half LSE sets to
+                    // 2'b10 on output-only pads) doesn't care which clock the tile gives it
+                    auto din_used = [&](const CellInfo *c) {
+                        return c->getPort(id_D_IN_0) != nullptr || c->getPort(id_D_IN_1) != nullptr;
+                    };
                     bool use[6] = {
-                            _io_pintype_need_clk_in(cell->ioInfo.pintype),
-                            _io_pintype_need_clk_in(compCell->ioInfo.pintype),
+                            _io_pintype_need_clk_in(cell->ioInfo.pintype) && din_used(cell),
+                            _io_pintype_need_clk_in(compCell->ioInfo.pintype) && din_used(compCell),
                             _io_pintype_need_clk_out(cell->ioInfo.pintype),
                             _io_pintype_need_clk_out(compCell->ioInfo.pintype),
                             _io_pintype_need_clk_en(cell->ioInfo.pintype),
