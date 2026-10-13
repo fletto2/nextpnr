@@ -562,7 +562,10 @@ void write_asc(const Context *ctx, std::ostream &out)
                     set_config(ti, config.at(iey).at(iex), "IoCtrl.REN_" + std::to_string(iez), !pullup);
                 } else {
                     set_config(ti, config.at(iey).at(iex), "IoCtrl.IE_" + std::to_string(iez), input_en);
-                    set_config(ti, config.at(iey).at(iex), "IoCtrl.REN_" + std::to_string(iez), !pullup);
+                    // UltraPlus: the vendor tools encode the pull-up only in the cf bits
+                    // below and leave REN clear
+                    bool up = ctx->args.type == ArchArgs::UP5K || ctx->args.type == ArchArgs::UP3K;
+                    set_config(ti, config.at(iey).at(iex), "IoCtrl.REN_" + std::to_string(iez), !pullup && !up);
                 }
 
                 if (ctx->args.type == ArchArgs::UP5K || ctx->args.type == ArchArgs::UP3K) {
