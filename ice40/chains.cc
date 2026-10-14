@@ -72,6 +72,9 @@ class ChainConstrainer
                 start_of_chain = true;
             } else {
                 NetInfo *carry_net = cell->ports.at(id_COUT).net;
+                // a carry out that nothing reads (kept to keep the carry enabled) needs no feed-out
+                if (carry_net != nullptr && carry_net->users.entries() == 0)
+                    carry_net = nullptr;
                 bool at_end = (curr_cell == carryc.cells.end() - 1);
                 if (carry_net != nullptr && (carry_net->users.entries() > 1 || at_end)) {
                     if (carry_net->users.entries() > 2 ||

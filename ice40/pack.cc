@@ -206,7 +206,12 @@ static void pack_carries(Context *ctx)
             std::set_intersection(i0_matches.begin(), i0_matches.end(), i1_matches.begin(), i1_matches.end(),
                                   std::inserter(carry_lcs, carry_lcs.end()));
             CellInfo *carry_lc = nullptr;
-            if (carry_ci_lc && carry_lcs.find(carry_ci_lc->name) != carry_lcs.end()) {
+            // a carry on constant inputs (they were disconnected) goes with the LC that takes its
+            // carry-in on I3 when that LC leaves I1/I2 free as well
+            bool free_ci_lc = carry_ci_lc && !i0_net && !i1_net && !carry_ci_lc->ports.at(id_I1).net &&
+                              !carry_ci_lc->ports.at(id_I2).net &&
+                              exhausted_cells.find(carry_ci_lc->name) == exhausted_cells.end();
+            if (carry_ci_lc && (carry_lcs.find(carry_ci_lc->name) != carry_lcs.end() || free_ci_lc)) {
                 carry_lc = carry_ci_lc;
             } else if (ci_const && carry_lcs.size() == 1) {
                 carry_lc = ctx->cells.at(*(carry_lcs.begin())).get();
