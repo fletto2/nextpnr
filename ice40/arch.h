@@ -659,11 +659,9 @@ struct Arch : BaseArch<ArchRanges>
         auto &pi = chip_info->pip_data[pip.index];
         auto &si = chip_info->bits_info->switches[pi.switch_index];
 
-        if (pi.flags & PipInfoPOD::FLAG_ROUTETHRU) {
-            NPNR_ASSERT(si.bel >= 0);
-            if (bel_to_cell[si.bel] != nullptr)
-                return true;
-        }
+        // the vendor router does not route through a LUT
+        if (pi.flags & PipInfoPOD::FLAG_ROUTETHRU)
+            return true;
 
         if (pi.flags & PipInfoPOD::FLAG_NOCARRY) {
             NPNR_ASSERT(si.bel >= 0);
