@@ -491,8 +491,10 @@ static void set_net_constant(const Context *ctx, NetInfo *orig, NetInfo *constne
                         ((constval && user.port == id_CE) || (!constval && user.port != id_CE)))) {
                 uc->ports[user.port].net = nullptr;
                 uc->ports[user.port].user_idx = {};
-            } else if (is_ff(ctx, uc) && constval && user.port == id_E) {
-                // an always-on enable is no enable, as in the vendor packing
+            } else if (is_ff(ctx, uc) && ((constval && user.port == id_E) ||
+                                          (!constval && (user.port == id_R || user.port == id_S)))) {
+                // an always-on enable or a never-active set/reset is left out, as in the
+                // vendor packing (it would also keep the cell from sharing a tile)
                 uc->ports[user.port].net = nullptr;
                 uc->ports[user.port].user_idx = {};
             } else if (is_sb_io(ctx, uc) && constval && user.port == id_CLOCK_ENABLE) {
