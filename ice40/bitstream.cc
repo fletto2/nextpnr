@@ -548,8 +548,18 @@ void write_asc(const Context *ctx, std::ostream &out)
                 bool val = (pin_type >> i) & 0x01;
                 set_config(ti, config.at(y).at(x), "IOB_" + std::to_string(z) + ".PINTYPE_" + std::to_string(i), val);
             }
-            if (cell.second->getPort(id_INPUT_CLK) || cell.second->getPort(id_OUTPUT_CLK))
-                set_config(ti, config.at(y).at(x), "NegClk", neg_trigger);
+            if (cell.second->getPort(id_INPUT_CLK) || cell.second->getPort(id_OUTPUT_CLK)) {
+                const ConfigEntryPOD &nc = find_config(ti, "NegClk");
+                if (ctx->args.type == ArchArgs::UP5K && nc.bits.size() == 2) {
+                    // UltraPlus: B9[13] inverts the input register clock, B15[13] the output's;
+                    // the vendor tools set only the one a register uses
+                    if (neg_trigger && cell.second->getPort(id_INPUT_CLK))
+                        set_config(ti, config.at(y).at(x), "NegClk", true, 0);
+                    if (neg_trigger && cell.second->getPort(id_OUTPUT_CLK))
+                        set_config(ti, config.at(y).at(x), "NegClk", true, 1);
+                } else
+                    set_config(ti, config.at(y).at(x), "NegClk", neg_trigger);
+            }
 
             bool input_en = false;
             if ((ctx->wire_to_net[ctx->getBelPinWire(bel, id_D_IN_0).index] != nullptr) ||
@@ -576,7 +586,9 @@ void write_asc(const Context *ctx, std::ostream &out)
                     set_config(ti, config.at(iey).at(iex), "IoCtrl.REN_" + std::to_string(iez), !pullup && !up);
                 }
 
-                if (ctx->args.type == ArchArgs::UP5K || ctx->args.type == ArchArgs::UP3K) {
+                // the RGB LED pads (open drain, no pull-up) keep their cf bits clear
+                bool rgb_pad = ctx->args.type == ArchArgs::UP5K && y == 31 && x >= 4 && x <= 6 && z == 0;
+                if ((ctx->args.type == ArchArgs::UP5K || ctx->args.type == ArchArgs::UP3K) && !rgb_pad) {
                     std::string pullup_resistor = "100K";
                     if (cell.second->attrs.count(id_PULLUP_RESISTOR))
                         pullup_resistor = cell.second->attrs.at(id_PULLUP_RESISTOR).as_string();
