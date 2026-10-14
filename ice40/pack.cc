@@ -202,6 +202,18 @@ static void pack_carries(Context *ctx)
                 }
             }
 
+            // a carry converted from an LSE FA2 half is named after it, its LUT likewise
+            CellInfo *named_lc = nullptr;
+            {
+                std::string cn = ci->name.str(ctx);
+                auto pos = cn.rfind("$carry");
+                if (pos != std::string::npos && pos + 7 == cn.size()) {
+                    auto it = ctx->cells.find(ctx->id(cn.substr(0, pos) + "$lut" + cn.substr(pos + 6) + "_LC"));
+                    if (it != ctx->cells.end() && exhausted_cells.find(it->first) == exhausted_cells.end())
+                        named_lc = it->second.get();
+                }
+            }
+
             std::set<IdString> carry_lcs;
             std::set_intersection(i0_matches.begin(), i0_matches.end(), i1_matches.begin(), i1_matches.end(),
                                   std::inserter(carry_lcs, carry_lcs.end()));
@@ -211,7 +223,9 @@ static void pack_carries(Context *ctx)
             bool free_ci_lc = carry_ci_lc && !i0_net && !i1_net && !carry_ci_lc->ports.at(id_I1).net &&
                               !carry_ci_lc->ports.at(id_I2).net &&
                               exhausted_cells.find(carry_ci_lc->name) == exhausted_cells.end();
-            if (carry_ci_lc && (carry_lcs.find(carry_ci_lc->name) != carry_lcs.end() || free_ci_lc)) {
+            if (named_lc && named_lc->ports.at(id_I1).net == i0_net && named_lc->ports.at(id_I2).net == i1_net) {
+                carry_lc = named_lc;
+            } else if (carry_ci_lc && (carry_lcs.find(carry_ci_lc->name) != carry_lcs.end() || free_ci_lc)) {
                 carry_lc = carry_ci_lc;
             } else if (ci_const && carry_lcs.size() == 1) {
                 carry_lc = ctx->cells.at(*(carry_lcs.begin())).get();
