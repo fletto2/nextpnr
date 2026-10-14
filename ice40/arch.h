@@ -409,6 +409,7 @@ struct Arch : BaseArch<ArchRanges>
     std::vector<CellInfo *> bel_to_cell;
     std::vector<NetInfo *> wire_to_net;
     std::vector<NetInfo *> pip_to_net;
+    std::vector<bool> io_neigh_pip;
     std::vector<WireId> switches_locked;
 
     // fast access to  X and Y IdStrings for building object names
@@ -756,10 +757,13 @@ struct Arch : BaseArch<ArchRanges>
     DelayQuad getPipDelay(PipId pip) const override
     {
         NPNR_ASSERT(pip != PipId());
+        // the vendor router reaches an I/O tile from a logic output over the span wires,
+        // not over the neighbour connection
+        int extra = io_neigh_pip[pip.index] ? 3000 : 0;
         if (fast_part)
-            return DelayQuad(chip_info->pip_data[pip.index].fast_delay);
+            return DelayQuad(chip_info->pip_data[pip.index].fast_delay + extra);
         else
-            return DelayQuad(chip_info->pip_data[pip.index].slow_delay);
+            return DelayQuad(chip_info->pip_data[pip.index].slow_delay + extra);
     }
 
     PipRange getPipsDownhill(WireId wire) const override

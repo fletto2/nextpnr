@@ -129,6 +129,16 @@ Arch::Arch(ArchArgs args) : args(args)
     pip_to_net.resize(chip_info->pip_data.size());
     switches_locked.resize(chip_info->num_switches);
 
+    io_neigh_pip.resize(chip_info->pip_data.size());
+    for (int i = 0; i < int(chip_info->pip_data.size()); i++) {
+        auto &pi = chip_info->pip_data[i];
+        if (chip_info->tile_grid[pi.y * chip_info->width + pi.x] != TILE_IO)
+            continue;
+        auto &src = chip_info->wire_data[pi.src];
+        if ((src.name_x != pi.x || src.name_y != pi.y) && strstr(src.name.get(), "/out"))
+            io_neigh_pip[i] = true;
+    }
+
     BaseArch::init_cell_types();
     BaseArch::init_bel_buckets();
 }
@@ -653,6 +663,42 @@ std::vector<GroupId> Arch::getGroupGroups(GroupId group) const
 
 // -----------------------------------------------------------------------
 
+// The vendor tools pack logic cells in slices of two LCs, a lone cell taking the first
+// one, so a cell alone in its pair moves to the even LC of the pair.
+static void lone_cells_to_even_lc(Context *ctx)
+{
+    dict<std::pair<int, int>, std::array<BelId, 8>> tiles;
+    for (auto bel : ctx->getBels()) {
+        if (ctx->getBelType(bel) != id_ICESTORM_LC)
+            continue;
+        Loc l = ctx->getBelLocation(bel);
+        tiles[{l.x, l.y}][l.z] = bel;
+    }
+    int moved = 0;
+    for (auto &t : tiles) {
+        bool clustered = false;
+        for (auto bel : t.second) {
+            CellInfo *ci = ctx->getBoundBelCell(bel);
+            if (ci && ci->cluster != ClusterId())
+                clustered = true;
+        }
+        if (clustered)
+            continue;
+        for (int k = 0; k < 4; k++) {
+            BelId a = t.second[2 * k], b = t.second[2 * k + 1];
+            CellInfo *cb = ctx->getBoundBelCell(b);
+            if (ctx->getBoundBelCell(a) || !cb || cb->belStrength > STRENGTH_STRONG)
+                continue;
+            PlaceStrength s = cb->belStrength;
+            ctx->unbindBel(b);
+            ctx->bindBel(a, cb, s);
+            moved++;
+        }
+    }
+    if (moved)
+        log_info("Moved %d lone logic cells to the even LC of their pair.\n", moved);
+}
+
 bool Arch::place()
 {
     std::string placer = str_or_default(settings, id_placer, defaultPlacer);
@@ -744,6 +790,7 @@ bool Arch::place()
     } else {
         log_error("iCE40 architecture does not support placer '%s'\n", placer.c_str());
     }
+    lone_cells_to_even_lc(getCtx());
     bool retVal = true;
     if (bool_or_default(settings, id_opt_timing, false)) {
         TimingOptCfg tocfg(getCtx());
