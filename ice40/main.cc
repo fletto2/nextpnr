@@ -259,6 +259,10 @@ std::unique_ptr<Context> Ice40CommandHandler::createContext(dict<std::string, Pr
         ctx->settings[ctx->id(val.first)] = val.second;
 
     ctx->settings[ctx->id("arch.package")] = ctx->archArgs().package;
+    // timing weight 40 and timing-driven ripup: about 0.5 MHz more on VERA (icetime, 4 seeds)
+    if (!vm.count("placer-heap-timingweight"))
+        ctx->settings[ctx->id("placerHeap/timingWeight")] = std::to_string(40);
+    ctx->settings[ctx->id("router/tmg_ripup")] = true;
     if (vm.count("promote-logic"))
         ctx->settings[id_promote_logic] = Property::State::S1;
     if (vm.count("no-promote-globals"))
