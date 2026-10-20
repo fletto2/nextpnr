@@ -1950,6 +1950,11 @@ def create_timing_info(chip: Chip, db: chipdb.Device):
                 lut.add_comb_arc("I1", "F", group_to_timingvalue(arc["b_f"]))
                 lut.add_comb_arc("I2", "F", group_to_timingvalue(arc["c_f"]))
                 lut.add_comb_arc("I3", "F", group_to_timingvalue(arc["d_f"]))
+                # Yosys also emits LUT1 to LUT3. Their inputs sit on the same bel pins as LUT4.
+                for n in range(1, 4):
+                    lutn = tmg.add_cell_variant(speed, f"LUT{n}")
+                    for i, g in enumerate(("a_f", "b_f", "c_f")[:n]):
+                        lutn.add_comb_arc(f"I{i}", "F", group_to_timingvalue(arc[g]))
                 mux5 = tmg.add_cell_variant(speed, "MUX2_LUT5")
                 mux5.add_comb_arc("I0", "O", group_to_timingvalue(arc["m0_ofx0"]))
                 mux5.add_comb_arc("I1", "O", group_to_timingvalue(arc["m1_ofx1"]))
@@ -1983,7 +1988,7 @@ def create_timing_info(chip: Chip, db: chipdb.Device):
                         sram.add_comb_arc(f"RAD[{rad}]", f"DO[{do}]", group_to_timingvalue(arc[f"rad{rad}_do"]))
                     sram.add_clock_out("CLK", f"DO[{do}]", ClockEdge.RISING, group_to_timingvalue(arc["clk_do"]))
                 for di in range(4):
-                    sram.add_setup_hold("CLK", f"DI[{di}", ClockEdge.RISING, group_to_timingvalue(arc["clk_di_set"]), group_to_timingvalue(arc["clk_di_hold"]))
+                    sram.add_setup_hold("CLK", f"DI[{di}]", ClockEdge.RISING, group_to_timingvalue(arc["clk_di_set"]), group_to_timingvalue(arc["clk_di_hold"]))
                 sram.add_setup_hold("CLK", "WRE", ClockEdge.RISING, group_to_timingvalue(arc["clk_wre_set"]), group_to_timingvalue(arc["clk_wre_hold"]))
                 for wad in range(4):
                     sram.add_setup_hold("CLK", f"WAD[{wad}]", ClockEdge.RISING, group_to_timingvalue(arc[f"clk_wad{wad}_set"]), group_to_timingvalue(arc[f"clk_wad{wad}_hold"]))
@@ -2020,8 +2025,8 @@ def create_timing_info(chip: Chip, db: chipdb.Device):
             elif group == "bram":
                 for sp_type in ("SP", "SPX9"):
                     sp = tmg.add_cell_variant(speed, sp_type)
-                    add_bram_bus_output(sp, "CLK", "DO", 36 if sp_type == "SPX9" else 32, "clk_do_bypass")
-                    add_bram_bus_input(sp, "CLK", "DI", 36 if sp_type == "SPX9" else 32, "clk_di")
+                    add_bram_bus_output(sp, "CLK", "DO", 36, "clk_do_bypass")
+                    add_bram_bus_input(sp, "CLK", "DI", 36, "clk_di")
                     add_bram_bus_input(sp, "CLK", "AD", 14, "clk_ad")
                     add_bram_bus_input(sp, "CLK", "BLKSEL", 3, "clk_blksel")
 
@@ -2029,8 +2034,8 @@ def create_timing_info(chip: Chip, db: chipdb.Device):
                         sp.add_setup_hold("CLK", sig, ClockEdge.RISING, group_to_timingvalue(arc[f"clk_{sig.lower()}_set"]), group_to_timingvalue(arc[f"clk_{sig.lower()}_hold"]))
                 for sdp_type in ("SDP", "SDPX9", "SDPB", "SDPX9B"):
                     sdp = tmg.add_cell_variant(speed, sdp_type)
-                    add_bram_bus_output(sdp, "CLKB", "DO", 36 if sdp_type.startswith("SDPX9") else 32, "clkb_do_bypass")
-                    add_bram_bus_input(sdp, "CLKA", "DI", 36 if sdp_type.startswith("SDPX9") else 32, "clka_di")
+                    add_bram_bus_output(sdp, "CLKB", "DO", 36, "clkb_do_bypass")
+                    add_bram_bus_input(sdp, "CLKA", "DI", 36, "clka_di")
                     add_bram_bus_input(sdp, "CLKA", "ADA", 14, "clka_ada")
                     add_bram_bus_input(sdp, "CLKB", "ADB", 14, "clkb_adb")
 
@@ -2045,10 +2050,10 @@ def create_timing_info(chip: Chip, db: chipdb.Device):
 
                 for dp_type in ("DP", "DPX9", "DPB", "DPX9B"):
                     dp = tmg.add_cell_variant(speed, dp_type)
-                    add_bram_bus_output(dp, "CLKA", "DOA", 36 if dp_type.startswith("DPX9") else 32, "clka_doa_bypass")
-                    add_bram_bus_output(dp, "CLKB", "DO", 36 if dp_type.startswith("DPX9") else 32, "clkb_dob_bypass")
-                    add_bram_bus_input(dp, "CLKA", "DIA", 36 if dp_type.startswith("DPX9") else 32, "clka_dia")
-                    add_bram_bus_input(dp, "CLKB", "DIB", 36 if dp_type.startswith("DPX9") else 32, "clkb_dib")
+                    add_bram_bus_output(dp, "CLKA", "DOA", 36, "clka_doa_bypass")
+                    add_bram_bus_output(dp, "CLKB", "DOB", 36, "clkb_dob_bypass")
+                    add_bram_bus_input(dp, "CLKA", "DIA", 36, "clka_dia")
+                    add_bram_bus_input(dp, "CLKB", "DIB", 36, "clkb_dib")
                     add_bram_bus_input(dp, "CLKA", "ADA", 14, "clka_ada")
                     add_bram_bus_input(sp, "CLKB", "ADB", 14, "clkb_adb")
 

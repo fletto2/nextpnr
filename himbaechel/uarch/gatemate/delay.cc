@@ -123,6 +123,15 @@ ClockEdge iosel_edge(const CellInfo *cell, IdString inv_param)
 {
     return bool_or_default(cell->params, inv_param) ? FALLING_EDGE : RISING_EDGE;
 }
+
+// postRoute() renames CLK_INT to the physical input used (CLK, or CINY2 when clocked via CP lines)
+IdString ff_clock_port(const CellInfo *cell)
+{
+    for (IdString p : {id_CLK_INT, id_CLK, id_CINY2})
+        if (cell->ports.count(p))
+            return p;
+    return id_CLK_INT;
+}
 } // namespace
 
 bool GateMateImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
@@ -147,6 +156,9 @@ bool GateMateImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdStrin
 
     int z = (cell->bel != BelId()) ? (ctx->getBelLocation(cell->bel).z % 2) : 0;
     if (cell->type.in(id_CPE_L2T4, id_CPE_LT_L, id_CPE_LT_U)) {
+        // Internal connection from upper L2T4 into the lower half
+        if (fromPort == id_COMBIN && toPort == id_OUT)
+            return true;
         IdString fp = fromPort, tp = toPort;
         if (z == 0) {
             if (map_upper.count(fp))
@@ -183,8 +195,30 @@ bool GateMateImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdStrin
     } else if (cell->type.in(id_CPE_FF, id_CPE_LATCH, id_CPE_FF_L, id_CPE_FF_U)) {
         return false;
     } else if (cell->type.in(id_CPE_CPLINES)) {
+        // Only report the input->output connection the router actually configured
+        auto bt = pass_backtrace.find(cell->name);
+        if (bt != pass_backtrace.end()) {
+            auto src = bt->second.find(toPort);
+            if (src != bt->second.end() && cell->getPort(src->second) != nullptr && src->second != fromPort)
+                return false;
+        }
+        if (fromPort.in(id_OUT1, id_OUT2)) {
+            get_delay_from_tmg_db(ctx->idf("timing_comb12_%s", toPort.c_str(ctx)), delay);
+            return true;
+        }
+        if (fromPort == id_COMPOUT) {
+            get_delay_from_tmg_db(ctx->idf("timing_comb12_compout_%s", toPort.c_str(ctx)), delay);
+            return true;
+        }
+        if (get_delay_from_tmg_db(ctx->idf("timing__ROUTING_%s_%s", fromPort.c_str(ctx), toPort.c_str(ctx)), delay))
+            return true;
+        // No data for PINY2->POUTX, use the Y1 equivalent
+        if (fromPort == id_PINY2 && toPort == id_POUTX)
+            get_delay_from_tmg_db(ctx->id("timing__ROUTING_PINY1_POUTX"), delay);
         return true;
     } else if (cell->type.in(id_CPE_BRIDGE)) {
+        if (toPort == id_MUXOUT)
+            get_delay_from_tmg_db(ctx->idf("timing__MX8_%s_OUT1", fromPort.c_str(ctx)), delay);
         return true;
     } else if (cell->type.in(id_CPE_COMP)) {
         return get_delay_from_tmg_db(fromPort == id_COMB1 ? id_timing_comb1_compout : id_timing_comb2_compout, delay);
@@ -251,14 +285,16 @@ TimingPortClass GateMateImpl::getPortTimingClass(const CellInfo *cell, IdString 
     auto disconnected = [cell](IdString p) { return !cell->ports.count(p) || cell->ports.at(p).net == nullptr; };
     clockInfoCount = 0;
     if (cell->type.in(id_CPE_L2T4, id_CPE_LT_L, id_CPE_LT_U)) {
-        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_COMBIN, id_CINY1, id_CINY2, id_CINX, id_PINX, id_D0_00, id_D1_00,
-                    id_D0_01, id_D1_01, id_D0_10, id_D1_10, id_D0_02, id_D1_02, id_D0_03, id_D1_03, id_D0_11, id_D1_11))
+        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_COMBIN, id_CINY1, id_CINY2, id_CINX, id_PINX, id_PINY1, id_PINY2,
+                    id_D0_00, id_D1_00, id_D0_01, id_D1_01, id_D0_10, id_D1_10, id_D0_02, id_D1_02, id_D0_03, id_D1_03,
+                    id_D0_11, id_D1_11))
             return TMG_COMB_INPUT;
         if (port == id_OUT && disconnected(id_IN1) && disconnected(id_IN2) && disconnected(id_IN3) &&
             disconnected(id_IN4) && disconnected(id_D0_00) && disconnected(id_D1_00) && disconnected(id_D0_01) &&
             disconnected(id_D1_01) && disconnected(id_D0_10) && disconnected(id_D1_10) && disconnected(id_D0_02) &&
             disconnected(id_D1_02) && disconnected(id_D0_03) && disconnected(id_D1_03) && disconnected(id_D0_11) &&
-            disconnected(id_D1_11))
+            disconnected(id_D1_11) && disconnected(id_COMBIN) && disconnected(id_CINX) && disconnected(id_PINX) &&
+            disconnected(id_CINY1) && disconnected(id_PINY1) && disconnected(id_CINY2) && disconnected(id_PINY2))
             return TMG_IGNORE; // LUT with no inputs is a constant
         if (port.in(id_OUT))
             return TMG_COMB_OUTPUT;
@@ -291,7 +327,7 @@ TimingPortClass GateMateImpl::getPortTimingClass(const CellInfo *cell, IdString 
             return TMG_COMB_OUTPUT;
         return TMG_COMB_INPUT;
     } else if (cell->type.in(id_CPE_FF, id_CPE_FF_L, id_CPE_FF_U, id_CPE_LATCH)) {
-        if (port.in(id_CLK_INT))
+        if (port == ff_clock_port(cell))
             return TMG_CLOCK_INPUT;
         clockInfoCount = 1;
         if (port == id_DOUT)
@@ -464,13 +500,14 @@ TimingClockingInfo GateMateImpl::getPortClockingInfo(const CellInfo *cell, IdStr
     info.clockToQ = DelayQuad(0);
     if (cell->type.in(id_CPE_FF, id_CPE_FF_L, id_CPE_FF_U, id_CPE_LATCH)) {
         bool inverted = int_or_default(cell->params, id_C_CPE_CLK, 0) == 0b01;
+        bool clk_via_cp = int_or_default(cell->params, id_C_CLKSEL, 0) == 1;
         info.edge = inverted ? FALLING_EDGE : RISING_EDGE;
-        info.clock_port = id_CLK_INT;
-        if (port.in(id_DIN, id_EN, id_SR))
+        info.clock_port = ff_clock_port(cell);
+        if (port.in(id_DIN, id_EN, id_EN_INT, id_PINY2, id_SR))
             get_setuphold_from_tmg_db(id_timing_del_Setup_D_L, id_timing_del_Hold_D_L, info.setup, info.hold);
         if (port.in(id_DOUT)) {
-            bool is_upper = (cell->bel != BelId()) && (ctx->getBelLocation(cell->bel).z == CPE_LT_U_Z);
-            get_delay_from_tmg_db(id_timing__SEQ_CLK_FF1_Q, info.clockToQ);
+            bool is_upper = (cell->bel != BelId()) && (ctx->getBelLocation(cell->bel).z == CPE_FF_U_Z);
+            get_delay_from_tmg_db(clk_via_cp ? id_timing__SEQ_CINY2_FF1_Q : id_timing__SEQ_CLK_FF1_Q, info.clockToQ);
             DelayQuad delay = DelayQuad{0};
             get_delay_from_tmg_db(is_upper ? id_timing_Q2_OUT2 : id_timing_Q1_OUT1, delay);
             info.clockToQ += delay;
