@@ -805,6 +805,9 @@ static void insert_global(Context *ctx, NetInfo *net, bool is_reset, bool is_cen
         gb->connectPort(id_USER_SIGNAL_TO_GLOBAL_BUFFER, net);
     NetInfo *glbnet = ctx->createNet(ctx->id(glb_name));
     gb->connectPort(id_GLOBAL_BUFFER_OUTPUT, glbnet);
+    // the pad's buffer has no fabric input, so copy_gb_constraints can't see the constraint
+    if (padin && net->clkconstr)
+        glbnet->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint(*net->clkconstr));
 
     std::vector<PortRef> keep_users;
     for (auto user : net->users) {
