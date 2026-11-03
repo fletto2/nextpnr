@@ -139,6 +139,25 @@ Arch::Arch(ArchArgs args) : args(args)
             io_neigh_pip[i] = true;
     }
 
+    // Charge the physical input's delay on the permutation pip and only the fastest input's in the LC,
+    // so the router sees that moving a critical signal to in3 saves ~0.4 ns. Unpermuted, nothing changes.
+    lut_perm_pin.assign(chip_info->pip_data.size(), -1);
+    for (int i = 0; i < int(chip_info->pip_data.size()); i++) {
+        auto &pi = chip_info->pip_data[i];
+        if (chip_info->wire_data[pi.dst].type != WireInfoPOD::WIRE_TYPE_LUTFF_IN_LUT)
+            continue;
+        const char *n = chip_info->wire_data[pi.src].name.get();
+        lut_perm_pin[i] = n[strlen(n) - 1] - '0';
+    }
+    delay_t lut_in[4], lut_min = 0;
+    for (int k = 0; k < 4; k++) {
+        DelayQuad d;
+        lut_in[k] = get_cell_delay_internal_raw(id_ICESTORM_LC, IdString(ID_I0 + k), id_O, d) ? d.maxDelay() : 0;
+        lut_min = k ? std::min(lut_min, lut_in[k]) : lut_in[k];
+    }
+    for (int k = 0; k < 4; k++)
+        lut_in_excess[k] = lut_in[k] - lut_min;
+
     BaseArch::init_cell_types();
     BaseArch::init_bel_buckets();
 }
@@ -1042,8 +1061,19 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
 
 bool Arch::get_cell_delay_internal(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
 {
+    if (!get_cell_delay_internal_raw(cell->type, fromPort, toPort, delay))
+        return false;
+    if (cell->type == id_ICESTORM_LC && fromPort.in(id_I0, id_I1, id_I2, id_I3)) {
+        delay_t d = delay.maxDelay() - lut_in_excess[fromPort.index - ID_I0];
+        delay = DelayQuad(std::max<delay_t>(d, 0));
+    }
+    return true;
+}
+
+bool Arch::get_cell_delay_internal_raw(IdString type, IdString fromPort, IdString toPort, DelayQuad &delay) const
+{
     for (auto &tc : chip_info->cell_timing) {
-        if (tc.type == cell->type.index) {
+        if (tc.type == type.index) {
             for (auto &path : tc.path_delays) {
                 if (path.from_port == fromPort.index && path.to_port == toPort.index) {
                     if (fast_part)

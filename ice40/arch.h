@@ -410,6 +410,10 @@ struct Arch : BaseArch<ArchRanges>
     std::vector<NetInfo *> wire_to_net;
     std::vector<NetInfo *> pip_to_net;
     std::vector<bool> io_neigh_pip;
+    // physical LUT input a permutation pip leaves from (-1 for any other pip), and how much slower
+    // each input is than the fastest one: LC timing is per logical input, the silicon's per physical one
+    std::vector<int8_t> lut_perm_pin;
+    delay_t lut_in_excess[4] = {0, 0, 0, 0};
     std::vector<WireId> switches_locked;
 
     // fast access to  X and Y IdStrings for building object names
@@ -758,6 +762,8 @@ struct Arch : BaseArch<ArchRanges>
         // the vendor router reaches an I/O tile from a logic output over the span wires,
         // not over the neighbour connection
         int extra = io_neigh_pip[pip.index] ? 3000 : 0;
+        if (lut_perm_pin[pip.index] >= 0)
+            extra += lut_in_excess[lut_perm_pin[pip.index]];
         if (fast_part)
             return DelayQuad(chip_info->pip_data[pip.index].fast_delay + extra);
         else
@@ -830,6 +836,7 @@ struct Arch : BaseArch<ArchRanges>
     // get_cell_delay_internal is similar to the above, but without false path checks and including clock to out delays
     // for internal arch use only
     bool get_cell_delay_internal(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const;
+    bool get_cell_delay_internal_raw(IdString type, IdString fromPort, IdString toPort, DelayQuad &delay) const;
     // Get the port class, also setting clockInfoCount to the number of TimingClockingInfos associated with a port
     TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const override;
     // Get the TimingClockingInfo of a port
