@@ -1181,6 +1181,8 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
         int last_arcs_without_ripup = 0;
         int timing_fail_count = 0;
         bool timing_ripup = ctx->setting<bool>("router/tmg_ripup", false);
+        int timing_stall = 0;
+        delay_t best_wns = std::numeric_limits<delay_t>::lowest();
         delay_t ripup_slack = 0;
 
         log_info("           |   (re-)routed arcs  |   delta    | remaining|       time spent     |\n");
@@ -1230,7 +1232,7 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
                 }
             }
             // Timing driven ripup
-            if (timing_ripup && router.arc_queue.empty() && timing_fail_count < 50) {
+            if (timing_ripup && router.arc_queue.empty() && timing_fail_count < 50 && timing_stall < 3) {
                 ++timing_fail_count;
                 router.tmg.run();
                 delay_t wns = 0, tns = 0;
@@ -1266,6 +1268,13 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
                 }
                 log_info("    %d arcs ripped up due to negative slack WNS=%.02fns TNS=%.02fns.\n",
                          int(router.arc_queue.size()), ctx->getDelayNS(wns), ctx->getDelayNS(tns));
+                // each round is a full reroute of the ripped nets; give up once rounds stop paying off
+                if (wns > best_wns) {
+                    best_wns = wns;
+                    timing_stall = 0;
+                } else {
+                    ++timing_stall;
+                }
                 iter_cnt = 0;
                 router.wireScores.clear();
                 router.netScores.clear();
