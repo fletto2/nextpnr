@@ -49,13 +49,19 @@ struct ClockDomainKey
 {
     IdString clock;
     ClockEdge edge;
-    ClockDomainKey(IdString clock_net, ClockEdge edge) : clock(clock_net), edge(edge) {};
-    // probably also need something here to deal with constraints
+    // capture domains only: paths from a related clock may take this many periods (a cell's
+    // nextpnr_multicycle attribute); paths from the same clock always get one
+    int multicycle = 1;
+    ClockDomainKey(IdString clock_net, ClockEdge edge, int multicycle = 1)
+            : clock(clock_net), edge(edge), multicycle(multicycle) {};
     inline bool is_async() const { return clock == IdString(); }
 
-    unsigned int hash() const { return mkhash(clock.hash(), int(edge)); }
+    unsigned int hash() const { return mkhash(mkhash(clock.hash(), int(edge)), multicycle); }
 
-    inline bool operator==(const ClockDomainKey &other) const { return (clock == other.clock) && (edge == other.edge); }
+    inline bool operator==(const ClockDomainKey &other) const
+    {
+        return (clock == other.clock) && (edge == other.edge) && (multicycle == other.multicycle);
+    }
 };
 
 typedef int domain_id_t;
@@ -226,8 +232,10 @@ struct TimingAnalyser
     CellInfo *cell_info(const CellPortKey &key);
     PortInfo &port_info(const CellPortKey &key);
 
-    domain_id_t domain_id(IdString cell, IdString clock_port, ClockEdge edge);
-    domain_id_t domain_id(const NetInfo *net, ClockEdge edge);
+    domain_id_t domain_id(IdString cell, IdString clock_port, ClockEdge edge, bool capture = false);
+    domain_id_t domain_id(const NetInfo *net, ClockEdge edge, int multicycle = 1);
+    // the period a path from launch to capture domain has, 0 if the clocks are not related
+    delay_t related_budget(const PerDomainPair &dp) const;
     domain_id_t domain_pair_id(domain_id_t launch, domain_id_t capture);
 
     void copy_domains(const CellPortKey &from, const CellPortKey &to, bool backwards);

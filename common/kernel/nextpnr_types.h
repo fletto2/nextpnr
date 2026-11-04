@@ -485,6 +485,9 @@ struct TimingResult
     std::vector<CriticalPath> xclock_paths;
     // Domains with no interior paths
     pool<IdString> empty_paths;
+    // Worst slack (ns) of the paths between related clocks (launch, capture), against the next
+    // capture edge (or the multicycle one)
+    dict<std::pair<IdString, IdString>, float> xclock_slack;
 
     // Detailed net timing data
     dict<IdString, std::vector<NetSinkTiming>> detailed_net_timings;

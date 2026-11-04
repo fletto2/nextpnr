@@ -234,6 +234,17 @@ static void log_fmax(Context *ctx, TimingResult &result, bool warn_on_failure)
             log_nonfatal_error("Max frequency for clock %*s'%s': %.02f MHz (%s at %.02f MHz)\n", width, "",
                                clock_name.c_str(), fmax, passed ? "PASS" : "FAIL", target);
     }
+    for (auto &xs : result.xclock_slack) {
+        bool passed = xs.second >= 0;
+        auto msg = stringf("Slack for related clocks '%s' -> '%s': %.02f ns (%s)\n", xs.first.first.c_str(ctx),
+                           xs.first.second.c_str(ctx), xs.second, passed ? "PASS" : "FAIL");
+        if (!warn_on_failure || passed)
+            log_info("%s", msg.c_str());
+        else if (allow_fail)
+            log_warning("%s", msg.c_str());
+        else
+            log_nonfatal_error("%s", msg.c_str());
+    }
     log_break();
 
     // Clock to clock delays for xpaths
