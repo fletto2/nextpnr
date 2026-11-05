@@ -1188,8 +1188,80 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
         log_info("           |   (re-)routed arcs  |   delta    | remaining|       time spent     |\n");
         log_info("   IterCnt |  w/ripup   wo/ripup |  w/r  wo/r |      arcs| batch(sec) total(sec)|\n");
 
+        // two nets can trade the last wires forever; give up when the queue stops reaching new lows
+        int best_queue = std::numeric_limits<int>::max(), since_best = 0;
+        // the complete routing with the best WNS seen before a timing-driven ripup round
+        typedef std::vector<std::pair<NetInfo *, std::vector<std::pair<WireId, PipMap>>>> Snapshot;
+        Snapshot complete;
+        bool restored = false;
+        auto snapshot = [&]() {
+            Snapshot snap;
+            for (auto &net : ctx->nets) {
+                NetInfo *ni = net.second.get();
+                std::vector<std::pair<WireId, PipMap>> ws;
+                for (auto &w : ni->wires)
+                    if (w.second.strength <= STRENGTH_STRONG)
+                        ws.push_back(std::make_pair(w.first, w.second));
+                if (!ws.empty())
+                    snap.push_back(std::make_pair(ni, std::move(ws)));
+            }
+            return snap;
+        };
+        auto restore = [&]() {
+            for (auto &net : ctx->nets) {
+                NetInfo *ni = net.second.get();
+                std::vector<WireId> weak;
+                for (auto &w : ni->wires)
+                    if (w.second.strength <= STRENGTH_STRONG)
+                        weak.push_back(w.first);
+                for (auto w : weak)
+                    ctx->unbindWire(w);
+            }
+            for (auto &nw : complete)
+                for (auto &w : nw.second) {
+                    if (w.second.pip == PipId())
+                        ctx->bindWire(w.first, nw.first, w.second.strength);
+                    else
+                        ctx->bindPip(w.second.pip, nw.first, w.second.strength);
+                }
+            restored = true;
+        };
+        // worst setup slack over the arcs the timing ripup looks at
+        auto routed_wns = [&]() {
+            router.tmg.run();
+            delay_t wns = 0;
+            for (auto &net : ctx->nets) {
+                NetInfo *ni = net.second.get();
+                if (router.skip_net(ni))
+                    continue;
+                bool is_locked = false;
+                for (auto &wire : ni->wires)
+                    if (wire.second.strength > STRENGTH_STRONG)
+                        is_locked = true;
+                if (is_locked)
+                    continue;
+                for (auto &usr : ni->users) {
+                    delay_t slack = router.tmg.get_setup_slack(CellPortKey(usr));
+                    if (slack != std::numeric_limits<delay_t>::lowest())
+                        wns = std::min(wns, slack);
+                }
+            }
+            return wns;
+        };
+
         auto prev_time = rstart;
         while (!router.arc_queue.empty()) {
+            if (int(router.arc_queue.size()) < best_queue) {
+                best_queue = int(router.arc_queue.size());
+                since_best = 0;
+            } else if (int(router.arc_queue.size()) <= 16 && ++since_best > 20000) {
+                log_warning("Router1 stalled with %d arcs left.\n", int(router.arc_queue.size()));
+                if (complete.empty())
+                    return false;
+                log_info("Going back to the best complete routing.\n");
+                restore();
+                break;
+            }
             if (++iter_cnt % 1000 == 0) {
                 auto curr_time = std::chrono::high_resolution_clock::now();
                 log_info("%10d | %8d %10d | %4d %5d | %9d| %10.02f %10.02f|\n", iter_cnt, router.arcs_with_ripup,
@@ -1234,6 +1306,7 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
             // Timing driven ripup
             if (timing_ripup && router.arc_queue.empty() && timing_fail_count < 50 && timing_stall < 3) {
                 ++timing_fail_count;
+                Snapshot cand = snapshot();
                 router.tmg.run();
                 delay_t wns = 0, tns = 0;
                 if (timing_fail_count == 1)
@@ -1271,14 +1344,20 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
                 // each round is a full reroute of the ripped nets; give up once rounds stop paying off
                 if (wns > best_wns) {
                     best_wns = wns;
+                    complete = std::move(cand);
                     timing_stall = 0;
                 } else {
                     ++timing_stall;
                 }
                 iter_cnt = 0;
+                best_queue = std::numeric_limits<int>::max();
                 router.wireScores.clear();
                 router.netScores.clear();
             }
+        }
+        if (!restored && !complete.empty() && routed_wns() < best_wns) {
+            log_info("Going back to the best complete routing (WNS %.02fns).\n", ctx->getDelayNS(best_wns));
+            restore();
         }
         auto rend = std::chrono::high_resolution_clock::now();
         log_info("%10d | %8d %10d | %4d %5d | %9d| %10.02f %10.02f|\n", iter_cnt, router.arcs_with_ripup,
@@ -1286,12 +1365,16 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
                  router.arcs_without_ripup - last_arcs_without_ripup, int(router.arc_queue.size()),
                  std::chrono::duration<float>(rend - prev_time).count(),
                  std::chrono::duration<float>(rend - rstart).count());
+        if (restored && !ctx->checkRoutedDesign())
+            log_error("Restored routing is incomplete.\n");
         log_info("Routing complete.\n");
         ctx->yield();
         log_info("Router1 time %.02fs\n", std::chrono::duration<float>(rend - rstart).count());
 
 #ifndef NDEBUG
-        router.check();
+        // the router's own arc maps describe the abandoned round, not the restored routing
+        if (!restored)
+            router.check();
         ctx->check();
         log_assert(ctx->checkRoutedDesign());
 #endif

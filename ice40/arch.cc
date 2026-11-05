@@ -827,6 +827,12 @@ bool Arch::route()
     bool result;
     if (router == "router1") {
         result = router1(getCtx(), Router1Cfg(getCtx()));
+        if (!result) {
+            // router2 starts from what router1 has routed
+            log_info("Finishing the routing with router2.\n");
+            router2(getCtx(), Router2Cfg(getCtx()));
+            result = true;
+        }
     } else if (router == "router2") {
         router2(getCtx(), Router2Cfg(getCtx()));
         result = true;
