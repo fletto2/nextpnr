@@ -181,6 +181,8 @@ class HeAPPlacer
         place_constraints();
         build_fast_bels();
         alloc_control_sets();
+        if (cfg.timing_driven)
+            depth_criticality();
         seed_placement();
         update_all_chains();
         wirelen_t hpwl = total_hpwl();
@@ -427,6 +429,23 @@ class HeAPPlacer
     dict<IdString, std::tuple<int, int>> bel_types;
 
     TimingAnalyser tmg;
+    // criticality from the logic alone (every unplaced arc one nominal route), known before any cell is
+    // placed: the deep paths are weighted from the first solve on, not only once a placement shows them
+    dict<CellPortKey, float> depth_crit;
+    void depth_criticality()
+    {
+        // only the cells the placer moves are unplaced here; the rest keep their real positions
+        ctx->unplaced_arc_delay = ctx->getDelayFromNS(1.5);
+        tmg.run();
+        for (auto &net : ctx->nets)
+            for (auto &usr : net.second->users) {
+                float c = tmg.get_criticality(CellPortKey(usr));
+                if (c > 0.5f)
+                    depth_crit[CellPortKey(usr)] = c;
+            }
+        ctx->unplaced_arc_delay = 0;
+        log_info("Logic depth marks %d arcs as critical before placement.\n", int(depth_crit.size()));
+    }
 
     dict<IdString, BoundingBox> constraint_region_bounds;
 
@@ -958,8 +977,11 @@ class HeAPPlacer
                                                                        std::abs(o_pos - this_pos)));
 
                     if (user_idx) {
-                        weight *= (1.0 + cfg.timingWeight * std::pow(tmg.get_criticality(CellPortKey(port)),
-                                                                     cfg.criticalityExponent));
+                        float crit = tmg.get_criticality(CellPortKey(port));
+                        auto dc = depth_crit.find(CellPortKey(port));
+                        if (dc != depth_crit.end())
+                            crit = std::max(crit, dc->second);
+                        weight *= (1.0 + cfg.timingWeight * std::pow(crit, cfg.criticalityExponent));
                     }
 
                     // If cell 0 is not fixed, it will stamp +w on its equation and -w on the other end's equation,
@@ -1140,6 +1162,7 @@ class HeAPPlacer
         }
         void legalise_cell(CellInfo *ci)
         {
+            ring_cell = nullptr;
             p->fast_bels.getBelsForCellType(ci->type, &fb);
             radius = 0;
             iter = 0;
@@ -1313,11 +1336,29 @@ class HeAPPlacer
                     std::swap(y0, y1);
             }
 
-            // Pick a random X and Y location within our search radius / search box
-            int nx = ctx->rng(x1 - x0 + 1) + x0;
-            int ny = ctx->rng(y1 - y0 + 1) + y0;
-            return std::make_pair(nx, ny);
+            // Visit the search box nearest first; the seed only orders locations at the same distance
+            if (ring_cell != ci || ring_radius != radius) {
+                ring_cell = ci;
+                ring_radius = radius;
+                ring_pos = 0;
+                int cx = p->cell_locs.at(ci->udata).x, cy = p->cell_locs.at(ci->udata).y;
+                std::vector<std::tuple<int, int, int, int>> locs;
+                for (int x = x0; x <= x1; x++)
+                    for (int y = y0; y <= y1; y++)
+                        locs.emplace_back(std::abs(x - cx) + std::abs(y - cy), ctx->rng(1 << 20), x, y);
+                std::sort(locs.begin(), locs.end());
+                ring.clear();
+                for (auto &l : locs)
+                    ring.emplace_back(std::get<2>(l), std::get<3>(l));
+            }
+            auto loc = ring.at(ring_pos);
+            ring_pos = (ring_pos + 1) % ring.size();
+            return loc;
         }
+        CellInfo *ring_cell = nullptr;
+        int ring_radius = -1;
+        size_t ring_pos = 0;
+        std::vector<std::pair<int, int>> ring;
 
         void try_place_cell(CellInfo *ci, int nx, int ny, int ctrl_set_group = -1)
         {

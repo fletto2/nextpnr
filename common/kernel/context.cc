@@ -109,8 +109,10 @@ CellInfo *Context::getCellForPinConstraint(const std::string &name)
 
 delay_t Context::predictArcDelay(const NetInfo *net_info, const PortRef &sink) const
 {
-    if (net_info->driver.cell == nullptr || net_info->driver.cell->bel == BelId() || sink.cell->bel == BelId())
+    if (net_info->driver.cell == nullptr)
         return 0;
+    if (net_info->driver.cell->bel == BelId() || sink.cell->bel == BelId())
+        return unplaced_arc_delay;
     IdString driver_pin, sink_pin;
     // Pick the first pin for a prediction; assume all will be similar enouhg
     for (auto pin : getBelPinsForCellPin(net_info->driver.cell, net_info->driver.port)) {
@@ -123,7 +125,13 @@ delay_t Context::predictArcDelay(const NetInfo *net_info, const PortRef &sink) c
     }
     if (driver_pin == IdString() || sink_pin == IdString())
         return 0;
-    return predictDelay(net_info->driver.cell->bel, driver_pin, sink.cell->bel, sink_pin);
+    delay_t d = predictDelay(net_info->driver.cell->bel, driver_pin, sink.cell->bel, sink_pin);
+    if (!route_feedback.empty()) {
+        auto fb = route_feedback.find(std::make_pair(sink.cell->name, sink.port));
+        if (fb != route_feedback.end())
+            d = delay_t(d * fb->second);
+    }
+    return d;
 }
 
 delay_t Context::getNetinfoRouteDelay(const NetInfo *net_info, const PortRef &user_info) const

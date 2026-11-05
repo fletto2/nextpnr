@@ -44,6 +44,11 @@ struct Context : Arch, DeterministicRNG
     // --------------------------------------------------------------
 
     delay_t predictArcDelay(const NetInfo *net_info, const PortRef &sink) const;
+    // routed / predicted delay of an arc from an earlier routing, by sink (cell, port): makes the
+    // prediction for a re-placement see the detours that arc took
+    dict<std::pair<IdString, IdString>, float> route_feedback;
+    // delay predicted for an arc with an unplaced end (0: none), for timing before placement
+    delay_t unplaced_arc_delay = 0;
 
     WireId getNetinfoSourceWire(const NetInfo *net_info) const;
     SSOArray<WireId, 2> getNetinfoSinkWires(const NetInfo *net_info, const PortRef &sink) const;

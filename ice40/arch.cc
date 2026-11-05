@@ -26,6 +26,7 @@
 #include "log.h"
 #include "nextpnr.h"
 #include "placer1.h"
+#include "timing.h"
 #include "placer_heap.h"
 #include "placer_static.h"
 #include "router1.h"
@@ -833,6 +834,8 @@ bool Arch::route()
             router2(getCtx(), Router2Cfg(getCtx()));
             result = true;
         }
+        if (result && getCtx()->setting<bool>("timing_driven", true))
+            replace_from_routing();
     } else if (router == "router2") {
         router2(getCtx(), Router2Cfg(getCtx()));
         result = true;
@@ -845,6 +848,119 @@ bool Arch::route()
 }
 
 // -----------------------------------------------------------------------
+
+// Worst setup slack of the routed design.
+static delay_t routed_wns(Context *ctx)
+{
+    TimingAnalyser tmg(ctx);
+    tmg.setup();
+    tmg.run();
+    delay_t wns = 0;
+    for (auto &net : ctx->nets) {
+        NetInfo *ni = net.second.get();
+        if (ni->driver.cell == nullptr)
+            continue;
+        for (auto &usr : ni->users) {
+            delay_t slack = tmg.get_setup_slack(CellPortKey(usr));
+            if (slack != std::numeric_limits<delay_t>::lowest())
+                wns = std::min(wns, slack);
+        }
+    }
+    return wns;
+}
+
+// When the routed design misses timing, the arcs on the failing paths took detours the placer did
+// not foresee. Tell the placer how much longer each of them got (routed / predicted delay), refine
+// the placement from where it is, route again and keep whichever result has the better WNS.
+void Arch::replace_from_routing()
+{
+    Context *ctx = getCtx();
+    delay_t best = routed_wns(ctx);
+    for (int pass = 1; pass <= 6 && best < 0; pass++) {
+        log_break();
+        log_info("Timing not met (WNS %.2f ns): placing again with the routed delays of the failing paths (pass %d).\n",
+                 ctx->getDelayNS(best), pass);
+        {
+            TimingAnalyser tmg(ctx);
+            tmg.setup();
+            tmg.run();
+            ctx->route_feedback.clear();
+            for (auto &net : ctx->nets) {
+                NetInfo *ni = net.second.get();
+                if (ni->driver.cell == nullptr || ni->wires.empty())
+                    continue;
+                for (auto &usr : ni->users) {
+                    delay_t slack = tmg.get_setup_slack(CellPortKey(usr));
+                    if (slack == std::numeric_limits<delay_t>::lowest() || slack > -best / 2)
+                        continue;
+                    delay_t pred = ctx->predictArcDelay(ni, usr);
+                    delay_t routed = ctx->getNetinfoRouteDelay(ni, usr);
+                    if (pred > 0 && routed > pred)
+                        ctx->route_feedback[std::make_pair(usr.cell->name, usr.port)] = float(routed) / float(pred);
+                }
+            }
+            log_info("    %d arcs carry their routed delay into the placement.\n", int(ctx->route_feedback.size()));
+        }
+        // keep the current placement and routing to go back to
+        std::vector<std::pair<CellInfo *, std::pair<BelId, PlaceStrength>>> cells;
+        for (auto &cell : ctx->cells)
+            if (cell.second->bel != BelId())
+                cells.push_back(std::make_pair(cell.second.get(), std::make_pair(cell.second->bel, cell.second->belStrength)));
+        std::vector<std::pair<NetInfo *, std::vector<std::pair<WireId, PipMap>>>> routing;
+        for (auto &net : ctx->nets) {
+            NetInfo *ni = net.second.get();
+            std::vector<std::pair<WireId, PipMap>> ws;
+            for (auto &w : ni->wires)
+                if (w.second.strength <= STRENGTH_STRONG)
+                    ws.push_back(std::make_pair(w.first, w.second));
+            if (!ws.empty())
+                routing.push_back(std::make_pair(ni, std::move(ws)));
+        }
+        auto unroute = [&]() {
+            for (auto &net : ctx->nets) {
+                NetInfo *ni = net.second.get();
+                std::vector<WireId> weak;
+                for (auto &w : ni->wires)
+                    if (w.second.strength <= STRENGTH_STRONG)
+                        weak.push_back(w.first);
+                for (auto w : weak)
+                    ctx->unbindWire(w);
+            }
+        };
+        unroute();
+        bool ok = placer1_refine(ctx, Placer1Cfg(ctx));
+        ctx->route_feedback.clear();
+        if (ok) {
+            ok = router1(ctx, Router1Cfg(ctx));
+            if (!ok)
+                unroute();
+        }
+        delay_t wns = ok ? routed_wns(ctx) : std::numeric_limits<delay_t>::lowest();
+        if (ok && wns > best) {
+            log_info("Re-placement improved WNS from %.2f to %.2f ns.\n", ctx->getDelayNS(best), ctx->getDelayNS(wns));
+            best = wns;
+            continue;
+        }
+        log_info("Re-placement did not improve WNS (%.2f ns); keeping the previous result.\n",
+                 ok ? ctx->getDelayNS(wns) : -1.0);
+        unroute();
+        for (auto &c : cells)
+            if (c.first->bel != BelId() && c.first->belStrength <= STRENGTH_STRONG)
+                ctx->unbindBel(c.first->bel);
+        for (auto &c : cells)
+            if (c.first->bel == BelId())
+                ctx->bindBel(c.second.first, c.first, c.second.second);
+        for (auto &nw : routing)
+            for (auto &w : nw.second) {
+                if (w.second.pip == PipId())
+                    ctx->bindWire(w.first, nw.first, w.second.strength);
+                else
+                    ctx->bindPip(w.second.pip, nw.first, w.second.strength);
+            }
+        break;
+    }
+    timing_analysis(ctx, true, true, true, true, true);
+}
 
 DecalXY Arch::getBelDecal(BelId bel) const
 {
