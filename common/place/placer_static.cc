@@ -1056,12 +1056,14 @@ class StaticPlacer
 #endif
             // Preconditioner from replace for now
 
-            float precond = std::max(1.0f, float(cell.pin_count) + dens_penalty[cell.group] * cell.rect.area());
+            float dens_penalty_mult = (cell.group >= cfg.logic_groups) ? 10.f : 1.f;
+
+            float precond = std::max(1.0f, float(cell.pin_count) + dens_penalty_mult * dens_penalty[cell.group] * cell.rect.area());
             if (ref) {
                 cell.ref_total_grad =
-                        ((cell.ref_wl_grad * -1) - cell.ref_dens_grad * dens_penalty[cell.group]) / precond;
+                        ((cell.ref_wl_grad * -1) - cell.ref_dens_grad * dens_penalty[cell.group] * dens_penalty_mult) / precond;
             } else {
-                cell.total_grad = ((cell.wl_grad * -1) - cell.dens_grad * dens_penalty[cell.group]) / precond;
+                cell.total_grad = ((cell.wl_grad * -1) - cell.dens_grad * dens_penalty[cell.group] * dens_penalty_mult) / precond;
             }
         }
     }
@@ -1651,6 +1653,9 @@ class StaticPlacer
     void place()
     {
         log_info("Running Static placer...\n");
+
+        auto startt = std::chrono::high_resolution_clock::now();
+
         init_grid();
         init_bels();
         prepare_cells();
@@ -1706,6 +1711,15 @@ class StaticPlacer
                 ++iter;
             }
         }
+        auto endtt = std::chrono::high_resolution_clock::now();
+
+        log_info("Static Placer Time: %.02fs\n", std::chrono::duration<double>(endtt - startt).count());
+
+#if !defined(NPNR_DISABLE_THREADS)
+        if (cfg.parallelRefine) {
+            parallel_refine(ctx, ParallelRefineCfg(ctx));
+        } else
+#endif
         {
             auto placer1_cfg = Placer1Cfg(ctx);
             placer1_cfg.hpwl_scale_x = cfg.hpwl_scale_x;
@@ -1725,6 +1739,8 @@ bool placer_static(Context *ctx, PlacerStaticCfg cfg)
 PlacerStaticCfg::PlacerStaticCfg(Context *ctx)
 {
     timing_driven = ctx->setting<bool>("timing_driven");
+
+    parallelRefine = ctx->setting<bool>("placerHeap/parallelRefine", false);
 
     hpwl_scale_x = 1;
     hpwl_scale_y = 1;
