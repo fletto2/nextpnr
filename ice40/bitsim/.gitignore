@@ -1,0 +1,4 @@
+__pycache__/
+build/
+x16emu-bitsim/
+*.o

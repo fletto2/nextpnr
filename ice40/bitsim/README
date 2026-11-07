@@ -1,0 +1,80 @@
+bitsim: run an iCE40 UP5K bitstream directly, two-valued, cycle exact against the gate cosim.
+
+  iceunpack X.bin X.asc
+  make ASC=X.asc PCF=vera_module.pcf O=build     (ACT=act.txt optional, see below)
+  build/replay EV OUT --clk50 PS [--mem PREFIX Z0,Z1,Z2,Z3]
+
+asc2net.py   .asc -> flat netlist, routing collapsed
+checknet.py  X.net routed.json: every cell at its BEL, config and nets, must equal the routed design
+gen.py       netlist -> bitsim_gen.c + bitsim_pins.h, straight-line levelized C
+runtime.inc  BRAM, SPRAM, MAC16 models (config arguments fold at compile time)
+bitsim.h     API: bitsim_reset/set/release/eval/get/driven/contention/spram_load
+replay.c     replays a recorded bench and compares every output pad sample
+mkbench.py   tb_scene_t.v / tb_audio.v -> gate-only recording bench
+
+Netlist lines (net 0/1 constants, -1 not connected):
+  lut OUT I0 I1 I2 I3 INITHEX X Y N        carry COUT I1 I2 CIN X Y N
+  ff Q D CLK CEN SR NEG SET ASYNC X Y N    alias A B
+  io NAME TYPE NEG PAD DIN0 DIN1 D0 D1 OE CEN ICLK OCLK LATCH X Y Z     refpad NAME
+  ram X Y RMODE WMODE NEGR NEGW RCLK RCLKE RE WCLK WCLKE WE RADDR*11 WADDR*11 MASK*16 WDATA*16 RDATA*16 INITHEX
+  spram X Y Z pins      mac X Y Z NEG_TRIGGER=n CFG=n... : pins      pll OUTNET LOCKNET ...
+
+Evaluation: settle, find clock edges, then for all domains that fired, in order: memory and MAC
+reads, memory writes, FF loads, RDATA commits. Repeat until no edge, up to DELTA_MAX; non-convergence
+returns -1. Same semantics as nonblocking assigns in the gate netlist, derived clocks a delta late.
+A combinational loop becomes a bounded inner loop and gen.py reports it (none in VERA).
+clk50 and pll_lock are pins, the PLL is not modelled; clk25 connects to nothing else.
+
+Speed comes from running only what can change: partitions of 16 nodes with dirty flags, FF groups
+and memory ports with an input-moved flag. To order the schedule by activity, gen.py --part 1 --count,
+build with -DBS_COUNT, replay (writes act.txt), then ACT=act.txt. Results do not depend on it.
+
+Not modelled, gen.py stops: DDR and registered or latched IO inputs, PLL types other than PAD,
+dynamic SPRAM SLEEP/POWEROFF. WARMBOOT ignored. MAC16 cascade pins read 0 (not in the chipdb).
+
+x16emu-bitsim: a copy of x16emu with $9F20-$9F3F going to the image as bus cycles, so X16 programs
+run against a bitstream with no board.
+
+  make emu ASC=X.asc PCF=vera_module.pcf O=DIR           -> DIR/emu/x16emu
+  SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy DIR/emu/x16emu -c816 -rom ROM -prg X.PRG -run -warp \
+      -fsroot DIR -echo -bitsim-secs N -bitsim-ppm screen.ppm
+
+-bitsim-secs stops after N simulated seconds and prints the bus counts. -bitsim-ppm rewrites a screen
+dump every simulated second. All the new code is src/vera_bus.c, the rest is #ifdef BITSIM. CPU clock
+is VBUS_CPU_HZ, default 7170000 (OtterX, T80 reads 7.17 MHz; add -DVBUS_CPU_HZ=8000000 for an X16).
+
+Every picosecond of VERA is simulated: each CPU cycle advances the pins by 1/VBUS_CPU_HZ whether or
+not it touches VERA. clk50 is free running, so the CPU and VERA clocks drift against each other as
+they do on the board. About 1/60 of real time.
+
+Bus, from OtterX sheet BusDecoder. ~VERA_CS is A15-A5 decoded and nothing else (no PHI2, VDA, VPA or
+bank), ~RE = PHI2 & RWB, ~WE = PHI2 & !RWB. So any cycle with its address in the VERA page is an
+access, internal cycles included. The model plays these per cycle, times from PHI2 fall at the start
+of the cycle (T = CPU period):
+
+  +20 ns          extbus_a          tAH >= 10, tADS <= 30 (W65C816S)
+  +30 ns          extbus_cs_n low   through the '138
+  T/2 + 8 ns      rd_n or wr_n low  through the '00
+  T/2 + 30 ns     write data on     tMDS
+  T - 10 ns       read data taken   tDSR
+  T + 8 ns        strobe high
+  T + 15 ns       write data off    tDHW >= 10
+  next cycle +30  cs_n high, if that cycle leaves the page
+
+rd_n and wr_n only move on VERA cycles: outside the page they would pulse every cycle, but all they
+feed is gated with cs_n.
+
+The CPU core runs whole instructions and skips cycles that don't transfer data, so vera_bus.c lists
+each instruction's cycles first (W65C816S table 5-7) and plays them. That gives the ghost cycles the
+hardware sees: an indexed store's read of the un-carried target, a page-crossing read's, and the
+extra cycle of a read-modify-write (read in native mode, a write of the old byte in emulation mode).
+16-bit RMW writes go high byte first, as the chip does, not in the core's order. The core's cycle
+count stands if it is longer (slow I/O), the list's if the core misses a penalty; -bitsim-secs prints
+the opcodes where they differ. An access the list did not predict still happens and counts as stray.
+
+The 65C02 has no list, it gets its data accesses only, one per call and no ghosts. Use -c816.
+Addresses are 16 bits, like the decoder, so a long access to bank N, $9F2x reaches VERA here too;
+with -gs banks above 0 go to RAM first. IRQ is sampled at the end of each instruction, not on the
+penultimate cycle. HostFS takes no simulated time. spi_miso is held high (no card), SD does not work,
+audio pads are ignored. The screen comes from the VGA pads at 640x480 timing; NTSC and RGB modes don't
+map. x16emu's own VERA stays idle, so the debugger's VERA panes show nothing real.
