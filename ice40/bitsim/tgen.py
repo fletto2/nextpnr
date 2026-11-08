@@ -312,7 +312,7 @@ class TGen:
                 "BOTOUTPUT_SELECT", "BOTADDSUB_LOWERINPUT", "BOTADDSUB_CARRYSELECT")]
         # icetime's cell type gives the arcs; it picks pipelining from A_REG alone, so whether each half's
         # output is registered comes from the configuration (cells_sim's OUTPUT_SELECT meaning)
-        base = re.sub(r"_(BYPASS|ALL_PIPELINE)$", "", self.rt.inst.get(name, ("SB_MAC16_MUL_U_16X16_BYPASS",))[0])
+        base = re.sub(r"_(BYPASS|ALL_PIPELINE|REG2)$", "", self.rt.inst.get(name, ("SB_MAC16_MUL_U_16X16_BYPASS",))[0])
         byp, pip = base + "_BYPASS", base + "_ALL_PIPELINE"
         if not any(k[0] == pip for k in self.rt.arc):
             pip = "SB_MAC16_MUL_U_16X16_ALL_PIPELINE"

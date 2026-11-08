@@ -104,7 +104,10 @@ not bitsim (every other line, CRCs included, matches the board).
 tmnet.py: routed delays out of an image, from icetime's timing netlist and timings_up5k.txt (min/typ/max).
 
   make build/icetime        # icetime.patch: stock icetime leaves IO OUTPUTENABLE and the DSP and SPRAM
-                            # clocks unconnected in its netlist, so those nets would get no delay
+                            # clocks unconnected in its netlist, so those nets would get no delay; it also
+                            # picks MAC16 pipelining from A_REG alone and times a 16x16 product taken from
+                            # PIPELINE_16x16_MULT_REG2 as combinational (false A/B -> O paths); the patch
+                            # times those MACs as registered (setup = slowest unregistered A/B -> O arc)
   build/icetime -d up5k -P sg48 -p x.pcf -o X.tv X.asc
   python3 tmnet.py X.asc X.tv [--corner 0|1|2] [--pads REGEX]     pad to FF, pad to pad, strobes to clock pins
   python3 tmnet.py X.asc X.tv --spi                               spi_sck and spi_mosi at the pads

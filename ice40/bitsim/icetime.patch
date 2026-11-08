@@ -1,6 +1,43 @@
 --- a/icetime/icetime.cc
 +++ b/icetime/icetime.cc
-@@ -1639,6 +1639,13 @@
+@@ -771,6 +771,22 @@
+ 	if (cell_type == "INTERCONN")
+ 		return 0;
+ 
++	if (cell_type == "SB_MAC16_MUL_U_16X16_REG2") {
++		// A/B setup to REG2 = the slowest A/B -> O arc of the unregistered multiplier (max corner,
++		// SB_MAC16_MUL_U_16X16_BYPASS, which includes the output mux, so slightly pessimistic);
++		// everything else (clock to out, control setups) as the fully pipelined cell.
++		static const double a_setup[16] = { 7.95729, 8.18192, 8.18963, 8.26568, 8.49056, 8.80088, 8.49383, 8.55512,
++				7.64079, 7.98025, 7.89191, 7.87051, 8.15833, 8.20121, 8.24359, 8.87906 };
++		static const double b_setup[16] = { 8.73236, 9.04977, 8.90584, 9.03753, 8.70144, 8.95732, 8.52702, 8.78069,
++				8.26129, 8.69560, 8.47899, 8.68103, 8.34920, 8.41570, 8.00796, 8.60540 };
++		int i;
++		if (out_port == "*setup*" && sscanf(in_port.c_str(), "A[%d]", &i) == 1 && i >= 0 && i < 16)
++			return a_setup[i];
++		if (out_port == "*setup*" && sscanf(in_port.c_str(), "B[%d]", &i) == 1 && i >= 0 && i < 16)
++			return b_setup[i];
++		cell_type = "SB_MAC16_MUL_U_16X16_ALL_PIPELINE";
++	}
++
+ 	if (device_type == "lp384")
+ 		return get_delay_lp384(cell_type, in_port, out_port);
+ 
+@@ -1432,7 +1448,12 @@
+ 		} else {
+ 			fprintf(stderr, "Warning: detected unknown/unsupported DSP config, defaulting to 16x16 MUL.\n");
+ 		}
+-		dsptype = basename + (pipeline ? "_ALL_PIPELINE" : "_BYPASS");
++		// The data has no variant for a 16x16 product taken from the REG2 pipeline register with the
++		// inputs unregistered; timing it as _BYPASS reports A/B -> O paths that end at that register.
++		int topout = (get_dsp_ip_cbit(extra_cells[key].at("TOPOUTPUT_SELECT_1")) << 1) | get_dsp_ip_cbit(extra_cells[key].at("TOPOUTPUT_SELECT_0"));
++		bool reg2 = !pipeline && !mode_8x8 && botout == 3 && topout == 3 && basename == "SB_MAC16_MUL_U_16X16" &&
++				get_dsp_ip_cbit(extra_cells[key].at("PIPELINE_16x16_MULT_REG2"));
++		dsptype = basename + (pipeline ? "_ALL_PIPELINE" : reg2 ? "_REG2" : "_BYPASS");
+ 		netlist_cell_types[cell] = dsptype;
+ 
+ 		for (int i = 0; i < 16; i++) {
+@@ -1639,6 +1660,13 @@
  		return;
  	}
  
@@ -14,7 +51,7 @@
  	if (sscanf(seg.name.c_str(), "lutff_%d/in_%d", &a, &b) == 2) {
  		//"logic" wires at the side of the device are actually IP or DSP
  		if((device_type == "up5k" || device_type == "up3k") && ((seg.x == 0) || (seg.x == int(config_tile_type.size()) - 1))) {
-@@ -1746,8 +1753,29 @@
+@@ -1746,8 +1774,29 @@
  		return;
  	}
  
