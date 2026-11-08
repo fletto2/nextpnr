@@ -1234,8 +1234,45 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
         }
     } else if (cell->type.in(id_ICESTORM_RAM, id_ICESTORM_SPRAM)) {
         return false;
+    } else if (cell->type == id_ICESTORM_DSP) {
+        if (dsp_port_kind(cell, fromPort) != 1 || dsp_port_kind(cell, toPort) != 3)
+            return false;
+        return get_cell_delay_internal_raw(IdString(cell->dspInfo.bypass), fromPort, toPort, delay);
     }
     return get_cell_delay_internal(cell, fromPort, toPort, delay);
+}
+
+bool Arch::has_cell_timing(IdString type) const
+{
+    for (auto &tc : chip_info->cell_timing)
+        if (tc.type == type.index)
+            return true;
+    return false;
+}
+
+// MAC16 port kinds: 0 clock or untimed, 1 combinational input, 2 register input, 3 combinational output,
+// 4 register output. Whether a half's output is registered follows OUTPUT_SELECT (cells_sim.v: adder
+// registered, 8x8 product through its MULT_REG, 16x16 product through PIPELINE_16x16_MULT_REG2). An
+// unregistered A/B/C/D or carry/control input is combinational unless both halves are registered;
+// then it ends at the pipeline register, with the slowest combinational arc as its setup.
+int Arch::dsp_port_kind(const CellInfo *cell, IdString port) const
+{
+    const auto &d = cell->dspInfo;
+    if (port == id_CLK)
+        return 0;
+    if (cell->ports.count(port) && cell->ports.at(port).type == PORT_OUT) {
+        bool reg = d.topReg;
+        std::string n = port.str(this);
+        if (n.size() > 2 && n.compare(0, 2, "O_") == 0 && std::stoi(n.substr(2)) < 16)
+            reg = d.botReg;
+        return reg ? 4 : 3;
+    }
+    std::string n = port.str(this);
+    if (n.size() > 2 && n[1] == '_' && n[0] >= 'A' && n[0] <= 'D')
+        return (d.inReg[n[0] - 'A'] || (d.topReg && d.botReg)) ? 2 : 1;
+    if (port.in(id_CI, id_ACCUMCI, id_SIGNEXTIN, id_ADDSUBTOP, id_ADDSUBBOT, id_OLOADTOP, id_OLOADBOT))
+        return (d.topReg && d.botReg) ? 2 : 1;
+    return 2;
 }
 
 bool Arch::get_cell_delay_internal(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
@@ -1306,8 +1343,23 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
             return TMG_REGISTER_OUTPUT;
         else
             return TMG_REGISTER_INPUT;
-    } else if (cell->type.in(id_ICESTORM_DSP, id_ICESTORM_SPRAM)) {
-        if (port.in(id_CLK, id_CLOCK))
+    } else if (cell->type == id_ICESTORM_DSP) {
+        switch (dsp_port_kind(cell, port)) {
+        case 0:
+            return TMG_CLOCK_INPUT;
+        case 1:
+            return TMG_COMB_INPUT;
+        case 3:
+            return TMG_COMB_OUTPUT;
+        case 4:
+            clockInfoCount = 1;
+            return TMG_REGISTER_OUTPUT;
+        default:
+            clockInfoCount = 1;
+            return TMG_REGISTER_INPUT;
+        }
+    } else if (cell->type == id_ICESTORM_SPRAM) {
+        if (port == id_CLOCK)
             return TMG_CLOCK_INPUT;
         else {
             clockInfoCount = 1;
@@ -1480,8 +1532,31 @@ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port
         } else {
             NPNR_ASSERT_FALSE("no clock data for IO cell port");
         }
-    } else if (cell->type.in(id_ICESTORM_DSP, id_ICESTORM_SPRAM)) {
-        info.clock_port = cell->type == id_ICESTORM_SPRAM ? id_CLOCK : id_CLK;
+    } else if (cell->type == id_ICESTORM_DSP) {
+        info.clock_port = id_CLK;
+        info.edge = RISING_EDGE;
+        if (cell->ports.at(port).type == PORT_OUT) {
+            if (!get_cell_delay_internal_raw(IdString(cell->dspInfo.pipeline), id_CLK, port, info.clockToQ) &&
+                !get_cell_delay_internal_raw(id_SB_MAC16_MUL_U_16X16_ALL_PIPELINE, id_CLK, port, info.clockToQ))
+                info.clockToQ = DelayQuad(100);
+        } else {
+            delay_t setup = 100;
+            std::string n = port.str(this);
+            bool data = n.size() > 2 && n[1] == '_' && n[0] >= 'A' && n[0] <= 'D';
+            if (!(data && cell->dspInfo.inReg[n[0] - 'A'])) {
+                // into the pipeline register through the multiplier/adder: its slowest arc to an output
+                for (auto &p : cell->ports) {
+                    DelayQuad d;
+                    if (p.second.type == PORT_OUT &&
+                        get_cell_delay_internal_raw(IdString(cell->dspInfo.bypass), port, p.first, d))
+                        setup = std::max(setup, d.maxDelay());
+                }
+            }
+            info.setup = DelayPair(setup);
+            info.hold = DelayPair(0);
+        }
+    } else if (cell->type == id_ICESTORM_SPRAM) {
+        info.clock_port = id_CLOCK;
         info.edge = RISING_EDGE;
         if (cell->ports.at(port).type == PORT_OUT) {
             bool has_clktoq = get_cell_delay_internal(cell, info.clock_port, port, info.clockToQ);
@@ -1575,6 +1650,46 @@ void Arch::assignCellInfo(CellInfo *cell)
 
     } else if (cell->type == id_SB_GB) {
         cell->gbInfo.forPadIn = bool_or_default(cell->attrs, id_FOR_PAD_IN);
+    } else if (cell->type == id_ICESTORM_DSP) {
+        auto p = [&](IdString k) { return int_or_default(cell->params, k); };
+        bool m8 = p(id_MODE_8x8);
+        int botout = p(id_BOTOUTPUT_SELECT), topout = p(id_TOPOUTPUT_SELECT);
+        int botlwr = p(id_BOTADDSUB_LOWERINPUT), topcarry = p(id_TOPADDSUB_CARRYSELECT);
+        bool botupr = p(id_BOTADDSUB_UPPERINPUT);
+        // the cell type icetime picks for this configuration (signedness has no timing effect)
+        std::string base = "SB_MAC16_MUL_U_16X16";
+        if (m8 && !botupr && botlwr == 0 && botout == 2)
+            base = "SB_MAC16_MUL_U_8X8";
+        else if (m8 && !botupr && botlwr == 1 && botout == 1)
+            base = "SB_MAC16_MAC_U_8X8";
+        else if (!m8 && !botupr && botlwr == 2 && botout == 1)
+            base = "SB_MAC16_MAC_U_16X16";
+        else if (m8 && !botupr && botlwr == 0 && botout == 1 && topcarry == 0)
+            base = "SB_MAC16_ACC_U_16P16";
+        else if (m8 && !botupr && botlwr == 0 && botout == 1 && topcarry == 2)
+            base = "SB_MAC16_ACC_U_32P32";
+        else if (m8 && botupr && botlwr == 0 && topcarry == 0)
+            base = "SB_MAC16_ADS_U_16P16";
+        else if (m8 && botupr && botlwr == 0 && topcarry == 2)
+            base = "SB_MAC16_ADS_U_32P32";
+        else if (m8 && botupr && botlwr == 1)
+            base = "SB_MAC16_MAS_U_8X8";
+        IdString byp = id(base + "_BYPASS"), pip = id(base + "_ALL_PIPELINE");
+        if (!has_cell_timing(byp))
+            byp = id_SB_MAC16_MUL_U_16X16_BYPASS;
+        if (!has_cell_timing(pip))
+            pip = id_SB_MAC16_MUL_U_16X16_ALL_PIPELINE;
+        cell->dspInfo.bypass = byp.index;
+        cell->dspInfo.pipeline = pip.index;
+        auto regd = [&](int sel, bool m8reg) {
+            return sel == 1 || (sel == 2 && m8reg) || (sel == 3 && p(id_PIPELINE_16x16_MULT_REG2));
+        };
+        cell->dspInfo.topReg = regd(topout, p(id_TOP_8x8_MULT_REG));
+        cell->dspInfo.botReg = regd(botout, p(id_BOT_8x8_MULT_REG));
+        cell->dspInfo.inReg[0] = p(id_A_REG);
+        cell->dspInfo.inReg[1] = p(id_B_REG);
+        cell->dspInfo.inReg[2] = p(id_C_REG);
+        cell->dspInfo.inReg[3] = p(id_D_REG);
     }
 }
 

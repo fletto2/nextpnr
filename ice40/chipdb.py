@@ -1019,6 +1019,16 @@ for i in range(11):
     tmport_to_constids["RADDR[%d]" % i] = "RADDR_%d" % i
     tmport_to_constids["WADDR[%d]" % i] = "WADDR_%d" % i
 
+# MAC16: one table per configuration icetime distinguishes (bypass and pipelined), keyed by its name
+for i in range(16):
+    for p in "ABCD":
+        tmport_to_constids["%s[%d]" % (p, i)] = "%s_%d" % (p, i)
+for i in range(32):
+    tmport_to_constids["O[%d]" % i] = "O_%d" % i
+for p in ["CI", "CO", "ACCUMCI", "ACCUMCO", "SIGNEXTIN", "SIGNEXTOUT", "ADDSUBTOP", "ADDSUBBOT", "OLOADTOP", "OLOADBOT"]:
+    tmport_to_constids[p] = p
+tmport_to_constids["posedge:CLK"] = "CLK"
+
 def add_cell_timingdata(bel_type, timing_cell, fast_db, slow_db):
     timing_entries = []
     database = slow_db if slow_db is not None else fast_db
@@ -1040,6 +1050,8 @@ if dev_name != "384":
     add_cell_timingdata("ICESTORM_RAM", "SB_RAM40_4K", fast_timings, slow_timings)
 if dev_name == "5k":
     add_cell_timingdata("SPRAM", "SB_SPRAM256KA", fast_timings, slow_timings)
+    for mac in sorted(set(k.split(".")[0] for k in (slow_timings or fast_timings) if k.startswith("SB_MAC16_"))):
+        add_cell_timingdata(mac, mac, fast_timings, slow_timings)
 
 
 for tile_xy, tile_type in sorted(tiles.items()):

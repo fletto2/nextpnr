@@ -156,6 +156,14 @@ struct ArchCellInfo : BaseClusterInfo
         {
             bool ledCurConnected;
         } ledInfo;
+        struct
+        {
+            // MAC16: timing tables (icetime's cell names) for the combinational and the clocked arcs
+            int bypass, pipeline;
+            // output halves (O[31:16], CO/ACCUMCO/SIGNEXTOUT; O[15:0]) and A/B/C/D taken from registers
+            bool topReg, botReg;
+            bool inReg[4];
+        } dspInfo;
     };
 };
 
