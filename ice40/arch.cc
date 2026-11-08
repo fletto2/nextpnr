@@ -863,9 +863,15 @@ bool Arch::route()
 static delay_t routed_wns(Context *ctx)
 {
     TimingAnalyser tmg(ctx);
-    tmg.setup();
-    tmg.run();
+    tmg.with_clock_skew = true; // as the router and the final report
+    tmg.setup(false, false, true);
     delay_t wns = 0;
+    // A clock's own paths as the final report judges them: the per-port slack below leaves out paths
+    // into flip-flops with a multicycle mark (another domain key on the same clock), which the report
+    // still times at one period.
+    for (auto &cf : tmg.get_timing_result().clock_fmax)
+        if (cf.second.achieved > 0 && cf.second.constraint > 0)
+            wns = std::min<delay_t>(wns, ctx->getDelayFromNS(1000.0 / cf.second.constraint - 1000.0 / cf.second.achieved));
     for (auto &net : ctx->nets) {
         NetInfo *ni = net.second.get();
         if (ni->driver.cell == nullptr)
