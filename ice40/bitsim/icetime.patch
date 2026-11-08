@@ -1,10 +1,10 @@
 --- a/icetime/icetime.cc
 +++ b/icetime/icetime.cc
-@@ -771,6 +771,22 @@
+@@ -771,6 +771,40 @@
  	if (cell_type == "INTERCONN")
  		return 0;
  
-+	if (cell_type == "SB_MAC16_MUL_U_16X16_REG2") {
++	if (cell_type == "SB_MAC16_MUL_U_16X16_REG2" || cell_type == "SB_MAC16_MAC_U_16X16_REG2ADD") {
 +		// A/B setup to REG2 = the slowest A/B -> O arc of the unregistered multiplier (max corner,
 +		// SB_MAC16_MUL_U_16X16_BYPASS, which includes the output mux, so slightly pessimistic);
 +		// everything else (clock to out, control setups) as the fully pipelined cell.
@@ -12,7 +12,25 @@
 +				7.64079, 7.98025, 7.89191, 7.87051, 8.15833, 8.20121, 8.24359, 8.87906 };
 +		static const double b_setup[16] = { 8.73236, 9.04977, 8.90584, 9.03753, 8.70144, 8.95732, 8.52702, 8.78069,
 +				8.26129, 8.69560, 8.47899, 8.68103, 8.34920, 8.41570, 8.00796, 8.60540 };
++		// REG2ADD: the product register (and the accumulator) feeding the unregistered adder outputs. Clock to
++		// out = the pipelined cell's clock to out plus the adder's slowest A/B/C/D -> output arc
++		// (SB_MAC16_ADS_U_32P32_BYPASS); both include the output mux, so slightly pessimistic. The adder
++		// controls' paths through the cell to O are not modelled here (nextpnr times them).
++		static const double clk_add[32] = { 3.86458, 3.93397, 4.16516, 4.23098, 4.61398, 4.69200, 4.83524, 4.88139,
++				5.33843, 5.47856, 5.33674, 5.81002, 5.55392, 5.74118, 6.35724, 5.87092, 6.47628, 6.25824, 6.35692,
++				6.68957, 6.46024, 6.19901, 6.40317, 6.44557, 6.37921, 6.51928, 6.77118, 6.73961, 6.63757, 6.79242,
++				6.88938, 6.97150 };
 +		int i;
++		if (cell_type == "SB_MAC16_MAC_U_16X16_REG2ADD" && in_port == "*clkedge*") {
++			if (sscanf(out_port.c_str(), "O[%d]", &i) == 1 && i >= 0 && i < 32)
++				return clk_add[i];
++			if (out_port == "CO")
++				return 4.23944 + 4.09845;
++			if (out_port == "ACCUMCO")
++				return 3.51631 + 3.37532;
++			if (out_port == "SIGNEXTOUT")
++				return 1.94112 + 1.14537;
++		}
 +		if (out_port == "*setup*" && sscanf(in_port.c_str(), "A[%d]", &i) == 1 && i >= 0 && i < 16)
 +			return a_setup[i];
 +		if (out_port == "*setup*" && sscanf(in_port.c_str(), "B[%d]", &i) == 1 && i >= 0 && i < 16)
@@ -23,7 +41,7 @@
  	if (device_type == "lp384")
  		return get_delay_lp384(cell_type, in_port, out_port);
  
-@@ -1432,7 +1448,12 @@
+@@ -1432,7 +1466,17 @@
  		} else {
  			fprintf(stderr, "Warning: detected unknown/unsupported DSP config, defaulting to 16x16 MUL.\n");
  		}
@@ -34,10 +52,15 @@
 +		bool reg2 = !pipeline && !mode_8x8 && botout == 3 && topout == 3 && basename == "SB_MAC16_MUL_U_16X16" &&
 +				get_dsp_ip_cbit(extra_cells[key].at("PIPELINE_16x16_MULT_REG2"));
 +		dsptype = basename + (pipeline ? "_ALL_PIPELINE" : reg2 ? "_REG2" : "_BYPASS");
++		// a registered 16x16 product into the accumulator adders, outputs unregistered (no such cell in the data)
++		int toplwrin = (get_dsp_ip_cbit(extra_cells[key].at("TOPADDSUB_LOWERINPUT_1")) << 1) | get_dsp_ip_cbit(extra_cells[key].at("TOPADDSUB_LOWERINPUT_0"));
++		if (!pipeline && !mode_8x8 && botout == 0 && topout == 0 && botlwrin == 2 && toplwrin == 2 && !botuprin &&
++				get_dsp_ip_cbit(extra_cells[key].at("PIPELINE_16x16_MULT_REG2")))
++			dsptype = "SB_MAC16_MAC_U_16X16_REG2ADD";
  		netlist_cell_types[cell] = dsptype;
  
  		for (int i = 0; i < 16; i++) {
-@@ -1639,6 +1660,13 @@
+@@ -1639,6 +1683,13 @@
  		return;
  	}
  
@@ -51,7 +74,7 @@
  	if (sscanf(seg.name.c_str(), "lutff_%d/in_%d", &a, &b) == 2) {
  		//"logic" wires at the side of the device are actually IP or DSP
  		if((device_type == "up5k" || device_type == "up3k") && ((seg.x == 0) || (seg.x == int(config_tile_type.size()) - 1))) {
-@@ -1746,8 +1774,29 @@
+@@ -1746,8 +1797,29 @@
  		return;
  	}
  

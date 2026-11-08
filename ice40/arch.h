@@ -841,6 +841,7 @@ struct Arch : BaseArch<ArchRanges>
     bool get_cell_delay_internal_raw(IdString type, IdString fromPort, IdString toPort, DelayQuad &delay) const;
     bool has_cell_timing(IdString type) const;
     int dsp_port_kind(const CellInfo *cell, IdString port) const;
+    bool dsp_adder_delay(IdString from, IdString to, delay_t &delay) const;
     // Get the port class, also setting clockInfoCount to the number of TimingClockingInfos associated with a port
     TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const override;
     // Get the TimingClockingInfo of a port

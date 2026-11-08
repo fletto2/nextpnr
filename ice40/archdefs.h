@@ -163,6 +163,9 @@ struct ArchCellInfo : BaseClusterInfo
             // output halves (O[31:16], CO/ACCUMCO/SIGNEXTOUT; O[15:0]) and A/B/C/D taken from registers
             bool topReg, botReg;
             bool inReg[4];
+            // unregistered adder outputs whose adder starts at a register inside the cell (the accumulator, or a
+            // registered product), and A/B ending at the 16x16 product register
+            bool topAdd, botAdd, prodReg;
         } dspInfo;
     };
 };

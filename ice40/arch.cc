@@ -1241,9 +1241,18 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
     } else if (cell->type.in(id_ICESTORM_RAM, id_ICESTORM_SPRAM)) {
         return false;
     } else if (cell->type == id_ICESTORM_DSP) {
-        if (dsp_port_kind(cell, fromPort) != 1 || dsp_port_kind(cell, toPort) != 3)
+        int to = dsp_port_kind(cell, toPort);
+        if (dsp_port_kind(cell, fromPort) != 1 || (to != 3 && to != 5))
             return false;
-        return get_cell_delay_internal_raw(IdString(cell->dspInfo.bypass), fromPort, toPort, delay);
+        if (get_cell_delay_internal_raw(IdString(cell->dspInfo.bypass), fromPort, toPort, delay))
+            return true;
+        // the multiplier tables have no arcs from the adder controls to O
+        delay_t d;
+        if (fromPort.in(id_ADDSUBTOP, id_ADDSUBBOT, id_OLOADTOP, id_OLOADBOT, id_CI) && dsp_adder_delay(fromPort, toPort, d)) {
+            delay = DelayQuad(d);
+            return true;
+        }
+        return false;
     }
     return get_cell_delay_internal(cell, fromPort, toPort, delay);
 }
@@ -1256,8 +1265,34 @@ bool Arch::has_cell_timing(IdString type) const
     return false;
 }
 
+// The MAC16's 32-bit adder with unregistered outputs (ADS_U_32P32_BYPASS): its slowest arc from `from` to `to`,
+// or with from == IdString() from any of A/B/C/D, the adder's two input words.
+bool Arch::dsp_adder_delay(IdString from, IdString to, delay_t &delay) const
+{
+    bool found = false;
+    delay = 0;
+    for (auto &tc : chip_info->cell_timing) {
+        if (tc.type != ID_SB_MAC16_ADS_U_32P32_BYPASS)
+            continue;
+        for (auto &path : tc.path_delays) {
+            if (path.to_port != to.index)
+                continue;
+            IdString f(path.from_port);
+            std::string n = f.str(this);
+            bool word = n.size() > 2 && n[1] == '_' && n[0] >= 'A' && n[0] <= 'D';
+            if (from == IdString() ? !word : f != from)
+                continue;
+            delay = std::max<delay_t>(delay, path.slow_delay);
+            found = true;
+        }
+    }
+    return found;
+}
+
 // MAC16 port kinds: 0 clock or untimed, 1 combinational input, 2 register input, 3 combinational output,
-// 4 register output. Whether a half's output is registered follows OUTPUT_SELECT (cells_sim.v: adder
+// 4 register output, 5 unregistered adder output fed from a register in the cell (accumulator feedback or
+// the registered 16x16 product): a register output whose clock-to-out runs through the adder, which can
+// also have combinational arcs (C/D, the adder controls). Whether a half's output is registered follows OUTPUT_SELECT (cells_sim.v: adder
 // registered, 8x8 product through its MULT_REG, 16x16 product through PIPELINE_16x16_MULT_REG2). An
 // unregistered A/B/C/D or carry/control input is combinational unless both halves are registered;
 // then it ends at the pipeline register, with the slowest combinational arc as its setup.
@@ -1271,11 +1306,14 @@ int Arch::dsp_port_kind(const CellInfo *cell, IdString port) const
         std::string n = port.str(this);
         if (n.size() > 2 && n.compare(0, 2, "O_") == 0 && std::stoi(n.substr(2)) < 16)
             reg = d.botReg;
-        return reg ? 4 : 3;
+        bool add = d.topAdd;
+        if (n.size() > 2 && n.compare(0, 2, "O_") == 0 && std::stoi(n.substr(2)) < 16)
+            add = d.botAdd;
+        return reg ? 4 : add ? 5 : 3;
     }
     std::string n = port.str(this);
     if (n.size() > 2 && n[1] == '_' && n[0] >= 'A' && n[0] <= 'D')
-        return (d.inReg[n[0] - 'A'] || (d.topReg && d.botReg)) ? 2 : 1;
+        return (d.inReg[n[0] - 'A'] || (d.prodReg && n[0] <= 'B') || (d.topReg && d.botReg)) ? 2 : 1;
     if (port.in(id_CI, id_ACCUMCI, id_SIGNEXTIN, id_ADDSUBTOP, id_ADDSUBBOT, id_OLOADTOP, id_OLOADBOT))
         return (d.topReg && d.botReg) ? 2 : 1;
     return 2;
@@ -1358,6 +1396,7 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
         case 3:
             return TMG_COMB_OUTPUT;
         case 4:
+        case 5:
             clockInfoCount = 1;
             return TMG_REGISTER_OUTPUT;
         default:
@@ -1545,6 +1584,9 @@ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port
             if (!get_cell_delay_internal_raw(IdString(cell->dspInfo.pipeline), id_CLK, port, info.clockToQ) &&
                 !get_cell_delay_internal_raw(id_SB_MAC16_MUL_U_16X16_ALL_PIPELINE, id_CLK, port, info.clockToQ))
                 info.clockToQ = DelayQuad(100);
+            delay_t add;
+            if (dsp_port_kind(cell, port) == 5 && dsp_adder_delay(IdString(), port, add))
+                info.clockToQ = DelayQuad(info.clockToQ.maxDelay() + add);
         } else {
             delay_t setup = 100;
             std::string n = port.str(this);
@@ -1696,6 +1738,13 @@ void Arch::assignCellInfo(CellInfo *cell)
         cell->dspInfo.inReg[1] = p(id_B_REG);
         cell->dspInfo.inReg[2] = p(id_C_REG);
         cell->dspInfo.inReg[3] = p(id_D_REG);
+        int toplwr = p(id_TOPADDSUB_LOWERINPUT);
+        bool topupr = p(id_TOPADDSUB_UPPERINPUT);
+        bool reg2 = !m8 && p(id_PIPELINE_16x16_MULT_REG2);
+        // A and B only reach the outputs through the 16x16 product register
+        cell->dspInfo.prodReg = reg2 && toplwr == 2 && botlwr == 2 && topout != 2 && botout != 2;
+        cell->dspInfo.topAdd = topout == 0 && (!topupr || (toplwr == 2 && reg2) || (toplwr == 1 && p(id_TOP_8x8_MULT_REG)));
+        cell->dspInfo.botAdd = botout == 0 && (!botupr || (botlwr == 2 && reg2) || (botlwr == 1 && p(id_BOT_8x8_MULT_REG)));
     }
 }
 
