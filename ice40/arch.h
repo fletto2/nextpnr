@@ -819,6 +819,7 @@ struct Arch : BaseArch<ArchRanges>
     bool place() override;
     bool route() override;
     void replace_from_routing();
+    bool cascade_from_routing();
 
     // -------------------------------------------------
 

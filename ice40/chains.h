@@ -17,11 +17,13 @@
  *
  */
 
+#include <vector>
 #include "nextpnr.h"
 
 NEXTPNR_NAMESPACE_BEGIN
 
 // This finds chains, inserts LCs to legalise them as needed, and sets relative constraints as appropriate
 void constrain_chains(Context *ctx);
+int cascade_luts(Context *ctx, const std::vector<std::pair<IdString, IdString>> &arcs);
 
 NEXTPNR_NAMESPACE_END

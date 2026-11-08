@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include "cells.h"
+#include "chains.h"
 #include "embed.h"
 #include "gfx.h"
 #include "log.h"
@@ -834,8 +835,17 @@ bool Arch::route()
             router2(getCtx(), Router2Cfg(getCtx()));
             result = true;
         }
-        if (result && getCtx()->setting<bool>("timing_driven", true))
+        if (result && getCtx()->setting<bool>("timing_driven", true)) {
             replace_from_routing();
+            if (cascade_from_routing()) {
+                result = router1(getCtx(), Router1Cfg(getCtx()));
+                if (!result) {
+                    router2(getCtx(), Router2Cfg(getCtx()));
+                    result = true;
+                }
+                replace_from_routing();
+            }
+        }
     } else if (router == "router2") {
         router2(getCtx(), Router2Cfg(getCtx()));
         result = true;
@@ -872,6 +882,53 @@ static delay_t routed_wns(Context *ctx)
 // When the routed design misses timing, the arcs on the failing paths took detours the placer did
 // not foresee. Tell the placer how much longer each of them got (routed / predicted delay), refine
 // the placement from where it is, route again and keep whichever result has the better WNS.
+// LUT cascades go on the arcs the finished routing shows to be worst, then everything is placed again.
+bool Arch::cascade_from_routing()
+{
+    Context *ctx = getCtx();
+    std::vector<std::pair<delay_t, std::pair<IdString, IdString>>> arcs;
+    {
+        TimingAnalyser tmg(ctx);
+        tmg.setup();
+        tmg.run();
+        for (auto &net : ctx->nets) {
+            NetInfo *ni = net.second.get();
+            if (!ni->driver.cell || ni->driver.cell->type != id_ICESTORM_LC || ni->driver.port != id_O)
+                continue;
+            for (auto &usr : ni->users) {
+                if (usr.cell->type != id_ICESTORM_LC)
+                    continue;
+                delay_t slack = tmg.get_setup_slack(CellPortKey(usr));
+                if (slack != std::numeric_limits<delay_t>::lowest())
+                    arcs.push_back(std::make_pair(slack, std::make_pair(ni->driver.cell->name, usr.cell->name)));
+            }
+        }
+    }
+    std::stable_sort(arcs.begin(), arcs.end(), [](const auto &x, const auto &y) { return x.first < y.first; });
+    arcs.resize(arcs.size() / 40);
+    std::vector<std::pair<IdString, IdString>> worst;
+    for (auto &a : arcs)
+        worst.push_back(a.second);
+    for (auto &net : ctx->nets) {
+        NetInfo *ni = net.second.get();
+        std::vector<WireId> weak;
+        for (auto &w : ni->wires)
+            if (w.second.strength <= STRENGTH_STRONG)
+                weak.push_back(w.first);
+        for (auto w : weak)
+            ctx->unbindWire(w);
+    }
+    for (auto &cell : ctx->cells)
+        if (cell.second->bel != BelId() && cell.second->belStrength <= STRENGTH_STRONG)
+            ctx->unbindBel(cell.second->bel);
+    int n = cascade_luts(ctx, worst);
+    log_info("%d LUT cascades on the %d worst arcs; placing again.\n", n, int(worst.size()));
+    assignArchInfo();
+    if (!place())
+        log_error("Placement failed after adding LUT cascades.\n");
+    return true;
+}
+
 void Arch::replace_from_routing()
 {
     Context *ctx = getCtx();

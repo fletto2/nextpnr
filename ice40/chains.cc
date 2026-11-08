@@ -279,6 +279,94 @@ class ChainConstrainer
     void constrain_chains() { process_carries(); }
 };
 
+// A LUT's raw output has a dedicated link to input 2 of the next LC in the tile, skipping the output
+// driver, LocalMux and InMux: about 2 ns a hop. Each link ties two LCs together, so only the arcs that
+// routing showed to be worst get one. arcs: driver LC, user LC, worst first.
+static void move_to_i2(CellInfo *ci, IdString pin, int pin_idx)
+{
+    if (pin_idx == 2)
+        return;
+    NetInfo *a = ci->getPort(pin), *b = ci->getPort(id_I2);
+    ci->disconnectPort(pin);
+    ci->disconnectPort(id_I2);
+    ci->connectPort(id_I2, a);
+    if (b)
+        ci->connectPort(pin, b);
+    uint64_t init = get_or_default(ci->params, id_LUT_INIT, Property(0, 16)).as_int64(), out = 0;
+    for (int i = 0; i < 16; i++) {
+        int bp = (i >> pin_idx) & 1, b2 = (i >> 2) & 1;
+        int j = (i & ~((1 << pin_idx) | 4)) | (b2 << pin_idx) | (bp << 2);
+        if ((init >> j) & 1)
+            out |= uint64_t(1) << i;
+    }
+    ci->params[id_LUT_INIT] = Property(out, 16);
+}
+
+int cascade_luts(Context *ctx, const std::vector<std::pair<IdString, IdString>> &arcs)
+{
+    const IdString pins[4] = {id_I0, id_I1, id_I2, id_I3};
+    auto free_lut = [&](CellInfo *ci) {
+        return ci->type == id_ICESTORM_LC && int_or_default(ci->params, id_CARRY_ENABLE) == 0 &&
+               ci->cluster == ClusterId();
+    };
+    dict<IdString, CellInfo *> next, prev;
+    int taken = 0;
+    for (auto &arc : arcs) {
+        CellInfo *a = ctx->cells.at(arc.first).get(), *b = ctx->cells.at(arc.second).get();
+        NetInfo *o = a->getPort(id_O);
+        if (!o || !free_lut(a) || !free_lut(b) || int_or_default(a->params, id_DFF_ENABLE) != 0)
+            continue;
+        if (next.count(a->name) || prev.count(b->name))
+            continue;
+        int pin_idx = -1, uses = 0;
+        for (int i = 0; i < 4; i++)
+            if (b->getPort(pins[i]) == o) {
+                pin_idx = i;
+                uses++;
+            }
+        if (uses != 1)
+            continue;
+        int len = 2;
+        CellInfo *h = a, *t = b;
+        for (; prev.count(h->name); h = prev.at(h->name))
+            len++;
+        for (; next.count(t->name); t = next.at(t->name))
+            len++;
+        if (len > 8 || h == b)
+            continue;
+        next[a->name] = b;
+        prev[b->name] = a;
+        move_to_i2(b, pins[pin_idx], pin_idx);
+        b->disconnectPort(id_I2);
+        NetInfo *lo = ctx->createNet(ctx->idf("%s$lo", a->name.c_str(ctx)));
+        a->connectPort(id_LO, lo);
+        b->connectPort(id_I2, lo);
+        if (o->users.entries() == 0)
+            a->disconnectPort(id_O);
+        taken++;
+    }
+    for (auto &n : next) {
+        CellInfo *root = ctx->cells.at(n.first).get();
+        if (prev.count(root->name))
+            continue;
+        root->cluster = root->name;
+        root->constr_abs_z = false;
+        root->constr_z = 0;
+        int z = 1;
+        for (CellInfo *c = n.second;; c = next.at(c->name), z++) {
+            c->cluster = root->name;
+            c->constr_x = 0;
+            c->constr_y = 0;
+            c->constr_z = z;
+            c->constr_abs_z = false;
+            root->constr_children.push_back(c);
+            if (!next.count(c->name))
+                break;
+        }
+    }
+    return taken;
+}
+
 void constrain_chains(Context *ctx)
 {
     log_info("Constraining chains...\n");
