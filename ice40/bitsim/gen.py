@@ -9,8 +9,8 @@ from asc2net import spram_pins, mac_pins
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOOUT = -1
-GROUP = 16      # partitions under one summary flag
 FFCHUNK = 16    # FFs under one flag
+GROUP = 16      # partitions under one summary flag
 
 
 class Net:
@@ -190,7 +190,14 @@ class Gen:
         self.count = False
         self.act_file = None
         self.act_shift = 2
+        self.trig_file = None
+        self.trig_stride = 4
+        self.trig_call = 8.0
+        self.trig_max = 64
+        self.trig_fixed = 0.1
         self.branchless = 0
+        self.vec = True
+        self.vec_min = 16
 
     # -- netlist preparation -------------------------------------------------
     def expand_io(self):
@@ -549,6 +556,106 @@ class Gen:
         assert len(out) == len(self.order)
         self.order = out
 
+    def partition_by_trig(self):
+        """Partitions built from recorded change sets (a --count run's trig.txt): a partition runs when
+        any net it reads from outside changes, so grow it with the ready node that adds the fewest
+        new wake-ups, and close it when running the node alone would be cheaper. Partitions still
+        come out in dependency order; only the schedule changes, never the result."""
+        vec = defaultdict(int)
+        ns = 0
+        rows = defaultdict(list)
+        for j, line in enumerate(open(self.trig_file)):
+            if j % self.trig_stride:
+                continue
+            for a in line.split():
+                rows[int(a)].append(ns)
+            ns += 1
+        for a, js in rows.items():
+            b = bytearray((ns + 7) // 8)
+            for j in js:
+                b[j >> 3] |= 1 << (j & 7)
+            vec[a] = int.from_bytes(b, "little")
+        comp_of = {}
+        for ci, comp in enumerate(self.order):
+            for nd in comp:
+                comp_of[nd] = ci
+        succ = defaultdict(set)
+        deg = [0] * len(self.order)
+        for ci, comp in enumerate(self.order):
+            ins = {comp_of[w] for nd in comp for w in self.fanin[nd]} - {ci}
+            deg[ci] = len(ins)
+            for w in ins:
+                succ[w].add(ci)
+        cins = [sorted({a for nd in comp for a in self.node_inputs(self.nodes[nd])}) for comp in self.order]
+        full = []
+        for ins in cins:
+            t = 0
+            for a in ins:
+                t |= vec.get(a, 0)
+            full.append(t)
+        alone = [t.bit_count() for t in full]
+        special = [len(c) > 1 or c[0] in self.fanin[c[0]] or self.nodes[c[0]][0] == "mac" for c in self.order]
+        ready = {i for i in range(len(self.order)) if deg[i] == 0}
+        kc, kn = self.trig_call, 1.0
+        self.parts = []
+        cur, T, inside = [], 0, set()
+
+        def close():
+            nonlocal cur, T, inside
+            if cur:
+                self.parts.append(dict(nodes=[nd for ci in cur for nd in self.order[ci]], loop=False))
+            cur, T, inside = [], 0, set()
+
+        def take(ci):
+            ready.discard(ci)
+            for w in succ[ci]:
+                deg[w] -= 1
+                if deg[w] == 0:
+                    ready.add(w)
+
+        def trig(ci):
+            if not any(self.drv.get(a) in inside for a in cins[ci]):
+                return full[ci]
+            t = 0
+            for a in cins[ci]:
+                if self.drv.get(a) not in inside:
+                    t |= vec.get(a, 0)
+            return t
+        while ready:
+            sp = [ci for ci in ready if special[ci]]
+            if sp:
+                ci = min(sp)
+                close()
+                comp = self.order[ci]
+                loop = len(comp) > 1 or comp[0] in self.fanin[comp[0]]
+                self.parts.append(dict(nodes=list(reversed(comp)) if loop else comp, loop=loop))
+                take(ci)
+                continue
+            base = T.bit_count()
+            best = None
+            for ci in ready:
+                t = T | trig(ci)
+                k = (t.bit_count() - base, alone[ci], ci)
+                if best is None or k < best[0]:
+                    best = (k, ci, t)
+            (_, a1, _), ci, t = best
+            if cur:
+                merged = t.bit_count() * (kc + kn * (len(cur) + 1))
+                # its D test runs whenever its group's G is set: a share of every eval
+                apart = base * (kc + kn * len(cur)) + a1 * (kc + kn) + self.trig_fixed * ns
+                if merged > apart or len(cur) >= self.trig_max:
+                    close()
+                    continue
+            cur.append(ci)
+            T = t
+            inside.update(self.order[ci])
+            take(ci)
+        close()
+        self.node_part = {}
+        for i, p in enumerate(self.parts):
+            for nd in p["nodes"]:
+                self.node_part[nd] = i
+
     def partition(self):
         part = self.part
         self.parts = []          # list of dict(nodes=[...], loop=bool)
@@ -560,6 +667,13 @@ class Gen:
                     self.parts.append(dict(nodes=cur, loop=False))
                     cur = []
                 self.parts.append(dict(nodes=list(reversed(comp)), loop=True))
+                continue
+            if self.nodes[comp[0]][0] == "mac":
+                # a MAC is as costly as a whole partition of LUTs; sharing one re-ran the others
+                if cur:
+                    self.parts.append(dict(nodes=cur, loop=False))
+                    cur = []
+                self.parts.append(dict(nodes=[comp[0]], loop=False))
                 continue
             cur.append(comp[0])
             if part and len(cur) >= part:
@@ -605,14 +719,128 @@ class Gen:
         self.stored -= {0, 1, NOOUT}
 
     def all_node_reads(self, nd):
-        if nd[0] == "mac":
-            m = self.n.macs[nd[1]]
-            return [v for k, v in m["p"].items() if not (k.startswith("O_") or k == "CO")]
+        # a MAC's other pins only reach O through its registers: mac_clk writes O after each step
         return self.node_inputs(nd)
+
+    def find_banks(self):
+        """Banks: LUTs in one partition with the same table whose inputs are either one net for all
+        (a select) or a different net per lane. With every lane operand and the outputs laid out
+        contiguously in v[], a bank evaluates 32 lanes per vector op (VERA's VRAM read muxes)."""
+        self.banks = {}      # partition -> list of banks
+        self.bank_of = {}    # node -> bank
+        self.vgat = set()
+        if not self.vec:
+            return
+        used = {}            # net -> (block id, lane) it is pinned to
+        blocks = []          # lists of nets that must be contiguous, in lane order
+        for pi, p in enumerate(self.parts):
+            if p["loop"]:
+                continue
+            luts = [nd for nd in p["nodes"] if self.nodes[nd][0] == "lut"]
+            freq = defaultdict(int)
+            for nd in luts:
+                for x in set(self.n.luts[self.nodes[nd][1]][0]):
+                    freq[x] += 1
+            # canonical form: the nets many LUTs here share first (by net), the rest in pin order
+            canon = {}
+            byt = defaultdict(list)
+            for nd in luts:
+                ins, tt = self.n.luts[self.nodes[nd][1]]
+                k = len(ins)
+                perm = sorted(range(k), key=lambda j: (freq[ins[j]] < self.vec_min, ins[j] if freq[ins[j]] >= self.vec_min else 0, j))
+                ntt = 0
+                for x in range(1 << k):
+                    old = 0
+                    for i, j in enumerate(perm):
+                        if x >> i & 1:
+                            old |= 1 << j
+                    if tt >> old & 1:
+                        ntt |= 1 << x
+                cins = [ins[j] for j in perm]
+                canon[nd] = (cins, ntt)
+                sel = tuple(x for x in cins if freq[x] >= self.vec_min)
+                byt[(ntt, k, sel)].append(nd)
+            for (tt, k, _), nds in byt.items():
+                if len(nds) < self.vec_min or "u>>" in lut_expr(list(range(k)), tt, ["x"] * k):
+                    continue
+                cols = [[canon[nd][0][j] for nd in nds] for j in range(k)]
+                # a select is the same net in most lanes: keep only those lanes
+                keep = set(range(len(nds)))
+                shared = {}
+                for j, col in enumerate(cols):
+                    net, cnt = max(((x, col.count(x)) for x in set(col)), key=lambda t: t[1])
+                    if cnt >= self.vec_min and cnt * 2 > len(col):
+                        shared[j] = net
+                        keep &= {i for i, x in enumerate(col) if x == net}
+                if not shared or len(keep) < self.vec_min:
+                    continue
+                lanes = sorted(keep, key=lambda i: nds.index(nds[i]))
+                bn = [nds[i] for i in lanes]
+                outs = [self.nodes[nd][1] for nd in bn]
+                vary = [j for j in range(k) if j not in shared]
+                ops = [[canon[nd][0][j] for nd in bn] for j in vary]
+                inside = set(outs)
+                ok = all(len(set(col)) == len(col) and not (set(col) & inside) and 0 not in col and 1 not in col for col in ops)
+                if not ok:
+                    continue
+                # every block (outputs, each operand column) pinned contiguously; a column may reuse an
+                # identical earlier block, otherwise none of its nets may be pinned already
+                want = [outs] + ops
+                pin = []
+                for col in want:
+                    hit = [used.get(x) for x in col]
+                    if all(h is None for h in hit) and len(set(col)) == len(col):
+                        pin.append(col)
+                    elif not (all(h is not None and h[0] == hit[0][0] for h in hit) and
+                              [h[1] for h in hit] == list(range(hit[0][1], hit[0][1] + len(col)))):
+                        ok = False
+                        break
+                if not ok or len({x for col in pin for x in col}) != sum(len(c) for c in pin):
+                    continue
+                for col in pin:
+                    for i, x in enumerate(col):
+                        used[x] = (len(blocks), i)
+                    blocks.append(col)
+                bank = dict(part=pi, nodes=bn, outs=outs, tt=tt, k=k, shared=shared, vary=vary, ops=ops)
+                self.banks.setdefault(pi, []).append(bank)
+                for nd in bn:
+                    self.bank_of[nd] = bank
+                self.stored |= set(outs) | {x for col in ops for x in col}
+        # pin lists packed into a word (memory address/data, MAC operands): contiguous, one
+        # 16-byte load and a byte mask instead of a shift and OR per bit
+        n = self.n
+        lists = []
+        for r in n.rams:
+            lists += [r["raddr"], r["waddr"], r["mask"], r["wdata"]]
+        for sp in n.sprams:
+            p = sp["p"]
+            lists += [[p["ADDRESS_%d" % k] for k in range(14)], [p["DATAIN_%d" % k] for k in range(16)]]
+        for m in n.macs:
+            p = m["p"]
+            lists += [[p["%s_%d" % (x, k)] for k in range(16)] for x in "ABCD"]
+        for col in lists:
+            col = list(col)
+            while col and col[-1] == 0:
+                col.pop()
+            if len(col) < 4 or len(col) > 16 or any(x in (0, 1) for x in col) or len(set(col)) != len(col):
+                continue
+            if tuple(col) in self.vgat:
+                continue
+            hit = [used.get(x) for x in col]
+            if all(h is None for h in hit):
+                for i, x in enumerate(col):
+                    used[x] = (len(blocks), i)
+                blocks.append(col)
+            elif not (all(h is not None and h[0] == hit[0][0] for h in hit) and
+                      [h[1] for h in hit] == list(range(hit[0][1], hit[0][1] + len(col)))):
+                continue
+            self.vgat.add(tuple(col))
+            self.stored |= set(col)
+        self.blocks = blocks
 
     def number_nets(self):
         idx = {0: 0, 1: 1}
-        order = []
+        order = [x for blk in getattr(self, "blocks", []) for x in blk]
         for p in self.parts:
             for nd in p["nodes"]:
                 order += self.node_outputs(self.nodes[nd])
@@ -626,6 +854,8 @@ class Gen:
                 idx[a] = len(idx)
         self.idx = idx
         self.nv = len(idx)
+        for blk in getattr(self, "blocks", []):
+            assert [idx[x] for x in blk] == list(range(idx[blk[0]], idx[blk[0]] + len(blk))), "bank block not contiguous"
 
     # -- emission -------------------------------------------------------------
     def v(self, a):
@@ -677,8 +907,13 @@ class Gen:
                     nets = [cen, sr] + [f["d"] for f in c]
                     out.append(dict(cen=cen, sr=sr, asyn=asyn, ffs=c, flag=alloc(nets)))
             self.chunks[key] = out
+        rport = {}
         for r in n.rams:
-            r["rflag"] = alloc(r["raddr"] + [r["re"], r["rclke"]])
+            # RAMs on the same read port nets (a wide memory split over cells) share one flag
+            k = (tuple(r["raddr"]), r["re"], r["rclke"], r["rclk"], r["nr"])
+            if k not in rport:
+                rport[k] = alloc(r["raddr"] + [r["re"], r["rclke"]])
+            r["rflag"] = rport[k]
             r["cflag"] = alloc([])
         for s in n.sprams:
             s["flag"] = alloc([v for k, v in s["p"].items() if not k.startswith("DATAOUT") and k != "CLOCK"])
@@ -692,6 +927,11 @@ class Gen:
 
     def gather(self, nets):
         """nets as an unsigned, bit i = nets[i]; unconnected reads 0"""
+        col = list(nets)
+        while col and col[-1] == 0:
+            col.pop()
+        if tuple(col) in getattr(self, "vgat", ()):
+            return "vgat(&v[%d], 0x%xu)" % (self.idx[col[0]], (1 << len(col)) - 1)
         t = []
         for i, a in enumerate(nets):
             if a == 0:
@@ -724,7 +964,8 @@ class Gen:
         else:
             i = kind[1]
             m = self.n.macs[i]
-            o.append("\t{ mac_res r; mac%d_eval(&r);" % i)
+            # most input changes leave the product alone (CE low, held, other half): skip the unpacking
+            o.append("\t{ mac_res r; mac%d_eval(&r); if (r.o != mpo[%d] || r.co != mpc[%d]) { mpo[%d] = r.o; mpc[%d] = r.co;" % (i, i, i, i, i))
             for j in range(32):
                 a = m["p"]["O_%d" % j]
                 if a not in (NOOUT, 0, 1):
@@ -732,7 +973,7 @@ class Gen:
             a = m["p"]["CO"]
             if a not in (NOOUT, 0, 1):
                 self.emit_store(o, a, "r.co", pi)
-            o.append("\t}")
+            o.append("\t} }")
 
     def emit_store(self, o, out, e, pi):
         m = self.mark(out, pi)
@@ -743,6 +984,75 @@ class Gen:
             o.append("\t{unsigned t=%s; if(t!=%s){%s=t;%s}}" % (e, self.v(out), self.v(out), m))
         else:
             o.append("\t%s=%s;" % (self.v(out), e))
+
+    def part_items(self, pi, p):
+        """the partition's nodes in order, each bank as one item where all its inputs are ready"""
+        banks = self.banks.get(pi)
+        if not banks:
+            return list(p["nodes"])
+        items, key = [], {}
+        for nd in p["nodes"]:
+            b = self.bank_of.get(nd)
+            it = id(b) if b else nd
+            if it not in key:
+                key[it] = len(items)
+                items.append(b if b else nd)
+        drv_item = {}
+        for k, it in enumerate(items):
+            for nd in (it["nodes"] if isinstance(it, dict) else [it]):
+                for a in self.node_outputs(self.nodes[nd]):
+                    drv_item[a] = k
+        deps = []
+        for k, it in enumerate(items):
+            nds = it["nodes"] if isinstance(it, dict) else [it]
+            deps.append({drv_item[a] for nd in nds for a in self.node_inputs(self.nodes[nd])
+                         if a in drv_item and drv_item[a] != k})
+        out, done = [], set()
+        while len(out) < len(items):
+            k = next((k for k in range(len(items)) if k not in done and deps[k] <= done), None)
+            assert k is not None, "bank makes a cycle in partition %d" % pi
+            done.add(k)
+            out.append(items[k])
+        return out
+
+    def emit_bank(self, o, b, pi):
+        n = len(b["outs"])
+        o.append("\t{ /* bank of %d */" % n)
+        for j, net in b["shared"].items():
+            if net not in (0, 1):
+                o.append("\tconst v32 s%d = vz + (uint8_t)%s;" % (j, self.v(net)))
+        for c0 in range(0, n, 32):
+            m = min(32, n - c0)
+            names = []
+            for j in range(b["k"]):
+                if j in b["shared"]:
+                    net = b["shared"][j]
+                    names.append(str(net) if net in (0, 1) else "s%d" % j)
+                else:
+                    names.append("o%d" % j)
+            o.append("\t{")
+            for jj, j in enumerate(b["vary"]):
+                o.append("\tv32 o%d; memcpy(&o%d, &v[%d], 32);" % (j, j, self.idx[b["ops"][jj][c0]]))
+            ob = self.idx[b["outs"][c0]]
+            o.append("\tv32 old; memcpy(&old, &v[%d], 32);" % ob)
+            o.append("\tv32 t = %s;" % lut_expr(list(range(b["k"])), b["tt"], names))
+            if m < 32:
+                o.append("\tconst v32 lm = {%s};" % ",".join("255" if i < m else "0" for i in range(32)))
+                o.append("\tt = (t & lm) | (old & ~lm);")
+            o.append("\tmemcpy(&v[%d], &t, 32);" % ob)
+            groups = defaultdict(int)
+            for i in range(m):
+                mk = self.mark(b["outs"][c0 + i], pi)
+                if mk:
+                    groups[mk] |= 1 << i
+            if groups:
+                o.append("\tuint32_t m = vmask(t ^ old);")
+                o.append("\tif (m) {")
+                for mk, bits in groups.items():
+                    o.append("\t\tif (m & 0x%xu) { %s }" % (bits, mk))
+                o.append("\t}")
+            o.append("\t}")
+        o.append("\t}")
 
     def emit_parts(self, o):
         for i, p in enumerate(self.parts):
@@ -756,8 +1066,11 @@ class Gen:
                 # the settled value decides, so tell every reader
                 o.append("\t" + "".join(self.mark(a, i) for a in outs))
             else:
-                for nd in p["nodes"]:
-                    self.emit_node(o, nd, i, False)
+                for it in self.part_items(i, p):
+                    if isinstance(it, dict):
+                        self.emit_bank(o, it, i)
+                    else:
+                        self.emit_node(o, it, i, False)
             o.append("}\n")
         if self.count:
             o.append("static uint64_t C[NP];\nvoid bitsim_counts(const char *path)\n{\n\tFILE *f = fopen(path, \"w\");\n\tif (!f) return;")
@@ -766,6 +1079,12 @@ class Gen:
                     for a in self.node_outputs(self.nodes[nd]):
                         o.append('\tfprintf(f, "%d %%llu\\n", (unsigned long long)C[%d]);' % (a, i))
             o.append("\tfclose(f);\n}\n")
+            # for --trig: which nets change together, read straight from v[]
+            net = [0] * self.nv
+            for x, i in self.idx.items():
+                net[i] = x
+            o.append("static const int vnet[%d] = {%s};" % (self.nv, ",".join(map(str, net))))
+            o.append("int bitsim_vsnap(const uint8_t **val, const int **nets)\n{\n\t*val = v;\n\t*nets = vnet;\n\treturn %d;\n}\n" % self.nv)
         o.append("static void settle(void)\n{")
         if self.part:
             for g in range(0, len(self.parts), GROUP):
@@ -872,6 +1191,19 @@ class Gen:
             s = "\tif (F[%d]) { F[%d]=0;\n%s\t}\n" % (r["rflag"], r["rflag"], s)
         return s
 
+    def ram_read_group(self, rs):
+        """one flag test and one address gather for every RAM on a read port"""
+        r = rs[0]
+        if r["re"] == 0 or r["rclke"] == 0:
+            return ""
+        if len(rs) == 1 or not self.part:
+            return "".join(self.ram_read(x) for x in rs)
+        cond = " && ".join(self.v(a) for a in (r["re"], r["rclke"]) if a != 1) or "1"
+        s = "\tif (F[%d]) { F[%d]=0;\n\tif (%s) { unsigned ad = %s;\n" % (r["rflag"], r["rflag"], cond, self.gather(r["raddr"]))
+        for x in rs:
+            s += "\t\tram_read(%d, %d, ad, %d);\n" % (x["id"], x["rm"], x["cflag"])
+        return s + "\t} }\n"
+
     def ram_write(self, r):
         i = r["id"]
         if r["we"] == 0 or r["wclke"] == 0:
@@ -883,7 +1215,8 @@ class Gen:
     def ram_commit(self, r):
         """RDATA nets change only here, after the FFs took their pre-edge values"""
         i = r["id"]
-        s = ["\tif (F[%d]) { F[%d]=0; unsigned o = ram_out(%d, %d);" % (r["cflag"], r["cflag"], r["rm"], i)]
+        # a read of the same word (most of them: the address sits still between accesses) changes nothing
+        s = ["\tif (F[%d]) { F[%d]=0; unsigned o = ram_out(%d, %d); if (o != rpo[%d]) { rpo[%d] = o;" % (r["cflag"], r["cflag"], r["rm"], i, i, i)]
         for j, a in enumerate(r["rdata"]):
             if a in (NOOUT, 0, 1):
                 continue
@@ -895,7 +1228,7 @@ class Gen:
                 s.append("\t\t{unsigned t=(o>>%d)&1; if(t!=%s){%s=t;%s}}" % (j, q, q, m))
             else:
                 s.append("\t\t%s=(o>>%d)&1;" % (q, j))
-        s.append("\t}")
+        s.append("\t} }")
         return "\n".join(s) + "\n"
 
     def spram_stage(self, s, i):
@@ -906,7 +1239,7 @@ class Gen:
             self.v(p["POWEROFF"]), g("ADDRESS", 14), g("DATAIN", 16), g("MASKWREN", 4), s["cflag"])
         if self.part:
             rd = "\tif (F[%d]) { F[%d]=0;\n%s\t}\n" % (s["flag"], s["flag"], rd)
-        c = ["\tif (F[%d]) { F[%d]=0; unsigned o = spram_out[%d];" % (s["cflag"], s["cflag"], i)]
+        c = ["\tif (F[%d]) { F[%d]=0; unsigned o = spram_out[%d]; if (o != spo[%d]) { spo[%d] = o;" % (s["cflag"], s["cflag"], i, i, i)]
         for j in range(16):
             a = p["DATAOUT_%d" % j]
             if a in (NOOUT, 0, 1):
@@ -917,7 +1250,7 @@ class Gen:
                 c.append("\t\t{unsigned t=(o>>%d)&1; if(t!=%s){%s=t;%s}}" % (j, q, q, m))
             else:
                 c.append("\t\t%s=(o>>%d)&1;" % (q, j))
-        c.append("\t}")
+        c.append("\t} }")
         return rd, "\n".join(c) + "\n"
 
     def emit_macs(self, o):
@@ -947,9 +1280,9 @@ class Gen:
                 self.v(p["CHOLD"]), self.v(p["DHOLD"]), self.v(p["OHOLDTOP"]), self.v(p["OHOLDBOT"]),
                 self.v(p["IRSTTOP"]), self.v(p["IRSTBOT"]), self.v(p["ORSTTOP"]), self.v(p["ORSTBOT"])))
             if self.part:
-                pp = self.mac_part.get(i)
-                if pp is not None:
-                    o.append("\t" + self.dset(pp))
+                # the step's new outputs go straight to their readers: re-running the partition would
+                # evaluate every MAC in it again
+                self.emit_node(o, self.mac_node[i], None, False)
             o.append("}\n")
 
     def emit(self, path):
@@ -958,20 +1291,24 @@ class Gen:
         o.append('#include "bitsim.h"\n#include <stdio.h>\n#include <string.h>\n')
         o.append("#define NV %d\n#define NP %d\n#define NSPRAM %d\n#define NMAC %d\n#define NEXT %d\n#define NRAM %d\n" % (
             self.nv, len(self.parts), len(n.sprams), max(1, len(n.macs)), max(1, len(self.bidirs)), len(n.rams)))
-        o.append("static uint8_t v[NV];\nstatic uint8_t D[NP], G[NP / %d + 1], F[%d];\n" % (GROUP, max(1, self.nflag)))
+        o.append("static uint8_t v[NV + 32]; /* vector banks read up to 31 bytes past a block */\ntypedef uint8_t v32 __attribute__((vector_size(32)));\nstatic const v32 vz;\n#if defined(__AVX2__) || defined(__SSE2__)\n#include <immintrin.h>\n#endif\nstatic inline uint32_t vmask(v32 c)\n{\n#ifdef __AVX2__\n\treturn (uint32_t)_mm256_movemask_epi8((__m256i)(c << 7));\n#else\n\tuint32_t m = 0;\n\tfor (int i = 0; i < 32; i++) m |= (uint32_t)(c[i] & 1) << i;\n\treturn m;\n#endif\n}\nstatic inline unsigned vgat(const uint8_t *p, unsigned m)\n{\n#ifdef __SSE2__\n\t__m128i x;\n\tmemcpy(&x, p, 16);\n\treturn (unsigned)_mm_movemask_epi8(_mm_slli_epi16(x, 7)) & m;\n#else\n\tunsigned r = 0;\n\tfor (int i = 0; i < 16; i++) r |= (unsigned)(p[i] & 1) << i;\n\treturn r & m;\n#endif\n}\nstatic uint32_t mpo[NMAC];\nstatic uint16_t rpo[NRAM ? NRAM : 1], spo[NSPRAM ? NSPRAM : 1];\nstatic uint8_t mpc[NMAC];\nstatic uint8_t D[NP], G[NP / %d + 1], F[%d];\n" % (GROUP, max(1, self.nflag)))
         o.append(open(os.path.join(HERE, "runtime.inc")).read())
         self.mac_part = {}
         for i, nd in enumerate(self.nodes):
             if nd[0] == "mac" and i in self.node_part:
                 self.mac_part[nd[1]] = self.node_part[i]
+        self.mac_node = {nd[1]: i for i, nd in enumerate(self.nodes) if nd[0] == "mac"}
         self.emit_ram(o)
         self.emit_macs(o)
         self.emit_parts(o)
         # one function per stage per domain
         for di, (key, m) in enumerate(self.dom):
             o.append("static void d%d_rd(void)\n{" % di)
+            groups = {}
             for r in m["rd"]:
-                o.append(self.ram_read(r).rstrip("\n"))
+                groups.setdefault(r["rflag"], []).append(r)
+            for rs in groups.values():
+                o.append(self.ram_read_group(rs).rstrip("\n"))
             stages = [self.spram_stage(s, n.sprams.index(s)) for s in m["spram"]]
             for st in stages:
                 o.append(st[0].rstrip("\n"))
@@ -1058,7 +1395,7 @@ class Gen:
             o.append("\tc += %s && ext_en[%d];" % (self.v(b["oe"]), i))
         o.append("\treturn c;\n}\n")
         o.append("void bitsim_reset(void)\n{\n\tmemset(v, 0, sizeof v);\n\tv[1] = 1;\n\tmemset(pv, 0, sizeof pv);")
-        o.append("\tmemset(D, 1, sizeof D);\n\tmemset(G, 1, sizeof G);\n\tmemset(F, 1, sizeof F);\n\tmemset(ext_en, 0, sizeof ext_en);\n\tmemset(ext_val, 0, sizeof ext_val);")
+        o.append("\tmemset(D, 1, sizeof D);\n\tmemset(G, 1, sizeof G);\n\tmemset(F, 1, sizeof F);\n\tmemset(ext_en, 0, sizeof ext_en);\n\tmemset(ext_val, 0, sizeof ext_val);\n\tmemset(mpo, 0, sizeof mpo);\n\tmemset(mpc, 0, sizeof mpc);\n\tmemset(rpo, 0, sizeof rpo);\n\tmemset(spo, 0, sizeof spo);")
         o.append("\tmemset(spram, 0, sizeof spram);\n\tmemset(spram_out, 0, sizeof spram_out);\n\tmemset(mac, 0, sizeof mac);")
         if n.rams:
             o.append("\tmemcpy(ram, ram_init, sizeof ram);\n\tmemset(ram_rd, 0, sizeof ram_rd);")
@@ -1093,12 +1430,16 @@ class Gen:
         self.build_nodes()
         self.isolate_state_reads()
         self.schedule()
-        if self.act_file:
-            self.order_by_activity()
-        self.partition()
+        if self.trig_file:
+            self.partition_by_trig()
+        else:
+            if self.act_file:
+                self.order_by_activity()
+            self.partition()
         self.analyse_readers()
         self.clock_domains()
         self.plan_flags()
+        self.find_banks()
         self.number_nets()
         self.emit(path)
         print("%d comb nodes, %d FF, %d RAM, %d SPRAM, %d MAC, %d stored nets, %d partitions, %d clock nets, %d domains" % (
@@ -1118,14 +1459,27 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--part", type=int, default=16)
     ap.add_argument("--ffchunk", type=int, default=FFCHUNK)
+    ap.add_argument("--group", type=int, default=GROUP)
     ap.add_argument("--count", action="store_true", help="emit bitsim_counts(); use with --part 1")
     ap.add_argument("--act", help="counts from a --count run, orders the schedule by activity")
     ap.add_argument("--act-shift", type=int, default=2)
+    ap.add_argument("--no-vec", action="store_true", help="no vector banks")
+    ap.add_argument("--vec-min", type=int, default=16, help="smallest vector bank")
+    ap.add_argument("--trig", help="trig.txt from a --count run: partitions that wake together")
+    ap.add_argument("--trig-stride", type=int, default=4)
+    ap.add_argument("--trig-call", type=float, default=8.0, help="cost of a partition run, in node evaluations")
+    ap.add_argument("--trig-max", type=int, default=64)
+    ap.add_argument("--trig-fixed", type=float, default=0.1, help="per-eval cost of one more partition, in node evaluations")
     ap.add_argument("--branchless", type=int, default=6, help="branch-free dirty marks up to this many flags per net")
     a = ap.parse_args()
     globals()["FFCHUNK"] = a.ffchunk
+    globals()["GROUP"] = a.group
     g = Gen(Net(a.net), a.part)
     g.count, g.act_file, g.act_shift, g.branchless = a.count, a.act, a.act_shift, a.branchless
+    g.trig_file, g.trig_stride, g.trig_call, g.trig_max = a.trig, a.trig_stride, a.trig_call, a.trig_max
+    g.trig_fixed = a.trig_fixed
+    g.vec = not a.no_vec
+    g.vec_min = a.vec_min
     g.run(a.out)
 
 

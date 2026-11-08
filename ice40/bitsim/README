@@ -1,7 +1,7 @@
 bitsim: run an iCE40 UP5K bitstream directly, two-valued, cycle exact against the gate cosim.
 
   iceunpack X.bin X.asc
-  make ASC=X.asc PCF=vera_module.pcf O=build     (ACT=act.txt optional, see below)
+  make ASC=X.asc PCF=vera_module.pcf O=build     (PROFILE= optional, see below)
   build/replay EV OUT --clk50 PS [--mem PREFIX Z0,Z1,Z2,Z3]
 
 --mem loads PREFIX0..3 (the RTL banks blk0..3) into SPRAM cells Z0..Z3. Placement decides which cell holds
@@ -30,10 +30,22 @@ returns -1. Same semantics as nonblocking assigns in the gate netlist, derived c
 A combinational loop becomes a bounded inner loop and gen.py reports it (none in VERA).
 clk50 and pll_lock are pins, the PLL is not modelled; clk25 connects to nothing else.
 
-Speed comes from running only what can change: partitions of 16 nodes with dirty flags, FF groups
-and memory ports with an input-moved flag. To order the schedule by activity, PROFILE="EV OUT --clk50 PS"
-counts a replay of any trace on this image first. Results do not depend on it, speed does: net numbers
-are per image, so never reuse an act.txt from another image.
+Speed comes from running only what can change: partitions with dirty flags, FF groups and memory
+ports with an input-moved flag, MAC/RAM outputs unpacked only when the word changed. LUTs in one
+partition with the same table, some inputs shared (selects) and the rest one net per lane, form a
+bank: its lane operands and outputs are numbered contiguously in v[] and evaluated 32 lanes per AVX2
+op (--vec-min 16; the VRAM read muxes in VERA, ~3% in x16emu; --no-vec turns it off). Without a profile,
+partitions are 16 nodes in level order. PROFILE="EV OUT --clk50 PS" first replays any trace on this
+image, recording which nets change in each eval (trig.txt), and gen.py --trig grows each partition
+with the ready node that adds the fewest new wake-ups on those records, closing it when running the
+node alone would cost less (--trig-call: one partition run in node evaluations, 8; --trig-fixed: the
+D test every partition costs on each eval, 0.1; together ~160 partitions on s7). On s7 this halves
+the LUT evaluations and runs ~1.3x faster than the older activity order (ACT=act.txt, --act); an s7
+profile carries over to the other traces. Results do not depend on it, speed does: net numbers are per
+image, so never reuse a profile from another image. The emulator's own workload makes a better profile than
+a trace: `make emu-count` builds $(O)/ecount/emu/x16emu, which writes trig.txt (every 1024th eval) where
+it runs; then `make emu TRIG=.../trig.txt`. Trained on 3 s of VERATESTALL, the boot screen ran ~15%
+faster than with the s7 trace profile.
 
 Not modelled, gen.py stops: DDR and registered or latched IO inputs, PLL types other than PAD,
 dynamic SPRAM SLEEP/POWEROFF. WARMBOOT ignored. MAC16 cascade pins read 0 (not in the chipdb).
@@ -51,7 +63,8 @@ is VBUS_CPU_HZ, default 7170000 (OtterX, T80 reads 7.17 MHz; add -DVBUS_CPU_HZ=8
 
 Every picosecond of VERA is simulated: each CPU cycle advances the pins by 1/VBUS_CPU_HZ whether or
 not it touches VERA. clk50 is free running, so the CPU and VERA clocks drift against each other as
-they do on the board. About 1/60 of real time.
+they do on the board. About 1/28 of real time on an idle i5-13400F P-core (27-28 s per simulated
+second, boot and READY screen; built with an emu-count profile, see above); E-cores run ~1.5x slower.
 
 Bus, from OtterX sheet BusDecoder. ~VERA_CS is A15-A5 decoded and nothing else (no PHI2, VDA, VPA or
 bank), ~RE = PHI2 & RWB, ~WE = PHI2 & !RWB. So any cycle with its address in the VERA page is an
@@ -90,12 +103,22 @@ not bitsim (every other line, CRCs included, matches the board).
 
 tmnet.py: routed delays out of an image, from icetime's timing netlist and timings_up5k.txt (min/typ/max).
 
-  icetime -d up5k -P sg48 -p x.pcf -o X.tv X.asc
+  make build/icetime        # icetime.patch: stock icetime leaves IO OUTPUTENABLE and the DSP and SPRAM
+                            # clocks unconnected in its netlist, so those nets would get no delay
+  build/icetime -d up5k -P sg48 -p x.pcf -o X.tv X.asc
   python3 tmnet.py X.asc X.tv [--corner 0|1|2] [--pads REGEX]     pad to FF, pad to pad, strobes to clock pins
   python3 tmnet.py X.asc X.tv --spi                               spi_sck and spi_mosi at the pads
 
 tgen.py: the same netlist as Verilog with those delays on every cell input, for iverilog against the
 reference traces, checked column by column like replay.
+
+Every element carries its routed delay to each input pin plus its own arcs, rise and fall apart: LUTs
+(route + arc to lcout or ltout, cascades included), carries, FFs (setup on D/ce/sr, clk to q, sr to q),
+block RAM and SPRAM (setups, clock to each data bit), MAC16, IO (pad and PRE_IO arcs, output registers,
+output enables), global buffers. Approximations: a setup is a delay on the input, so hold is not checked
+separately; the PLL has no arcs in timings_up5k.txt (*), its output is the ideal clk50; a MAC16 output
+fed by a register (OUTPUT_SELECT 1, or 2/3 with the 8x8/16x16 pipeline reg) uses the ALL_PIPELINE clock to
+O arcs, its inputs the worst BYPASS input to O arc as setup, a combinational one the worst arc into each O.
 
   python3 tgen.py X.net X.tv OUT.v [--corner 0|1|2] [--scale 0]
   iverilog -g2012 -s tb -o X.vvp OUT.v cells_sim.v
@@ -110,7 +133,8 @@ bus too. Slow: a few microseconds of chip time per second.
 
 Results, s7 and casc_s4, a3/s4/s5/s7/f9 to 2 ms each: zero delay and typ match everywhere. At max, f9
 differs in two ways, both timing and not model errors: a DC_VIDEO write shows one clk later (strobe to clk
-synchronizer), and 6 of 1204 DATA0 reads come back stale. Those are the third of three DATA0 reads whose
+synchronizer), and 6 of 1204 DATA0 reads come back stale (7 on casc_s4; same with the patched icetime's
+DSP/SPRAM clock and IO enable delays). Those are the third of three DATA0 reads whose
 strobes end 121 to 132 ns apart, about 3 clk; at max the fetch needs one clk more. A 65C02 at 12 MHz can't
 read that fast (LDA abs is 4 cycles, 333 ns).
 

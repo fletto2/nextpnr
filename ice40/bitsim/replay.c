@@ -9,6 +9,7 @@
 
 #ifdef BS_COUNT
 void bitsim_counts(const char *path);
+int bitsim_vsnap(const uint8_t **val, const int **nets);
 #endif
 
 struct ev { int64_t t; uint8_t cs, rd, wr, a, d, drive, miso; };
@@ -180,10 +181,28 @@ int main(int argc, char **argv)
 			edges++;
 			acted = 1;
 		}
+#ifdef BS_COUNT
+		/* every 4th eval: which nets it changed, for gen.py --trig */
+		static FILE *tf;
+		static uint8_t pre[1 << 15];
+		static uint64_t nevals;
+		const uint8_t *vv;
+		const int *vn;
+		int nv = bitsim_vsnap(&vv, &vn), snap = acted && (nevals++ & 3) == 0 && nv <= (int)sizeof pre;
+		if (!tf) tf = fopen("trig.txt", "w");
+		if (snap) memcpy(pre, vv, nv);
+#endif
 		if (acted && bitsim_eval() < 0) {
 			printf("%" PRId64 " ps: no convergence\n", tt);
 			break;
 		}
+#ifdef BS_COUNT
+		if (snap && tf) {
+			for (int k = 0; k < nv; k++)
+				if (pre[k] != vv[k]) fprintf(tf, "%d ", vn[k]);
+			fputc('\n', tf);
+		}
+#endif
 		if (acted) contention += (uint64_t)(bitsim_contention() != 0);
 		if (sm[si].t == tt) {
 			for (int k = 0; check && k < 29; k++) {

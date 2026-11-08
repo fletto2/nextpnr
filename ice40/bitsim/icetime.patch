@@ -1,0 +1,47 @@
+--- a/icetime/icetime.cc
++++ b/icetime/icetime.cc
+@@ -1639,6 +1639,13 @@
+ 		return;
+ 	}
+ 
++	if (sscanf(seg.name.c_str(), "io_%d/OUT_ENB", &a) == 1) {
++		auto cell = make_seg_pre_io(seg.x, seg.y, a);
++		netlist_cell_ports[cell]["OUTPUTENABLE"] = net_name(net);
++		make_inmux(seg.x, seg.y, net);
++		return;
++	}
++
+ 	if (sscanf(seg.name.c_str(), "lutff_%d/in_%d", &a, &b) == 2) {
+ 		//"logic" wires at the side of the device are actually IP or DSP
+ 		if((device_type == "up5k" || device_type == "up3k") && ((seg.x == 0) || (seg.x == int(config_tile_type.size()) - 1))) {
+@@ -1746,8 +1753,29 @@
+ 		return;
+ 	}
+ 
+-	if (seg.name == "lutff_global/clk" || seg.name == "lutff_global/cen" || seg.name == "lutff_global/s_r")
++	if (seg.name == "lutff_global/clk" || seg.name == "lutff_global/cen" || seg.name == "lutff_global/s_r" || seg.name == "clk")
+ 	{
++		// on the up5k side tiles these feed a DSP or SPRAM pin, not logic cells
++		if ((device_type == "up5k" || device_type == "up3k") && ((seg.x == 0) || (seg.x == int(config_tile_type.size()) - 1))) {
++			std::tuple<int, int, std::string> ecnet(seg.x, seg.y, seg.name);
++			bool ip = false;
++			for (auto &ec : extra_cells)
++				for (auto &entry : ec.second)
++					if (entry.second == ecnet)
++						ip = true;
++			if (ip) {
++				std::string primnet;
++				auto cell = make_dsp_ip(seg.x, seg.y, seg.name, primnet);
++				if (cell != "") {
++					netlist_cell_ports[cell][primnet] = net_name(seg.net);
++					make_inmux(seg.x, seg.y, net, seg.name == "lutff_global/clk" || seg.name == "clk" ? "ClkMux" :
++							seg.name == "lutff_global/cen" ? "CEMux" : "SRMux");
++				}
++				return;
++			}
++		}
++		if (seg.name == "clk")
++			return;
+ 		for (int i = 0; i < 8; i++)
+ 		{
+ 			if (!dff_uses_clock(seg.x, seg.y, i))

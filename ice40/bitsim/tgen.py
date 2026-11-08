@@ -159,8 +159,6 @@ class TGen:
                 self.carry.append((int(f[1]), int(f[2]), int(f[3]), int(f[4]), tuple(map(int, f[5:8]))))
             elif f[0] == "ff":
                 self.ffs.append((list(map(int, f[1:9])), tuple(map(int, f[9:12]))))
-        clks = sorted(w[0] for w in (self.rt.walk("lc40_%d_%d_%d" % p, "clk") for _, p in self.ffs) if w)
-        self.clk_default = clks[len(clks) // 2]
 
     def ps(self, x):
         return int(round(x * self.scale))
@@ -267,10 +265,10 @@ class TGen:
             init = r["init"]
             par = ",".join(".INIT_%X(256'h%s)" % (b, init[64 * b:64 * b + 64]) for b in range(16))
             o.append(self.ram_inst(i, r, inst, rp, vec, par))
-            q = arc[("SB_RAM40_4K", "RCLK", "RDATA[0]")][0]
             for j, a2 in enumerate(r["rdata"]):
                 if a2 != NO:
-                    o.append(self.drive("rd%d[%d]" % (i, j), q, q, a2))
+                    q = arc[("SB_RAM40_4K", "RCLK", "RDATA[%d]" % j)]
+                    o.append(self.drive("rd%d[%d]" % (i, j), q[0], q[1], a2))
         sp = [l.split() for l in open(a.net) if l.startswith("spram ")]
         for i, s in enumerate(n.sprams):
             s["name"] = "SPRAM_%s_%s_%s" % tuple(sp[i][1:4])
@@ -286,25 +284,22 @@ class TGen:
                     vec("RADDR", r["raddr"]), self.clkpin(inst, "WCLK", r["wclk"]), rp("WCLKE", r["wclke"]), rp("WE", r["we"]),
                     vec("WADDR", r["waddr"]), vec("MASK", r["mask"]), vec("WDATA", r["wdata"])))
 
-    def clocked(self, net):
-        if not self.scale:
-            return self.clkpin("", "", net)
-        return self.delayed(self.net(net), self.clk_default, self.clk_default)
-
     def spram(self, i, s):
         p = s["p"]
         name = s["name"]
         self.o.append("// spram idx %d is %s" % (s["idx"], name))
-        pn = lambda k: self.pin(name, k, p[k])
-        bus = lambda nm, w: "{" + ",".join(self.pin(name, "%s[%d]" % (nm, j), p["%s_%d" % (nm, j)]) for j in reversed(range(w))) + "}"
-        q = self.rt.arc[("SB_SPRAM256KA", "CLOCK", "DATAOUT[0]")][0]
-        self.o.append("wire [15:0] so%d; spr #(%d) sp%d(%s,%s,%s,%s,%s,%s,%s,%s,%s,so%d);" % (
-            i, self.ps(q), s["idx"], self.clocked(p["CLOCK"]), pn("CHIPSELECT"), pn("WREN"), pn("STANDBY"), pn("SLEEP"), pn("POWEROFF"),
-            bus("ADDRESS", 14), bus("DATAIN", 16), bus("MASKWREN", 4), i))
+        su = self.rt.setup["SB_SPRAM256KA"]
+        sp = lambda k, a: self.pin(name, k, a, *su.get(k, (0, 0)))
+        pn = lambda k: sp(k, p[k])
+        bus = lambda nm, w: "{" + ",".join(sp("%s[%d]" % (nm, j), p["%s_%d" % (nm, j)]) for j in reversed(range(w))) + "}"
+        self.o.append("wire [15:0] so%d; spr #(0) sp%d(%s,%s,%s,%s,%s,%s,%s,%s,%s,so%d);" % (
+            i, s["idx"], self.clkpin(name, "CLOCK", p["CLOCK"]), pn("CHIPSELECT"), pn("WREN"), pn("STANDBY"), pn("SLEEP"),
+            pn("POWEROFF"), bus("ADDRESS", 14), bus("DATAIN", 16), bus("MASKWREN", 4), i))
         for j in range(16):
             a = p["DATAOUT_%d" % j]
             if a != NO:
-                self.o.append("assign %s = so%d[%d];" % (self.net(a), i, j))
+                q = self.rt.arc[("SB_SPRAM256KA", "CLOCK", "DATAOUT[%d]" % j)]
+                self.o.append(self.drive("so%d[%d]" % (i, j), q[0], q[1], a))
 
     def mac(self, i, m):
         p, c = m["p"], m["cfg"]
@@ -315,15 +310,38 @@ class TGen:
                "A_SIGNED", "B_SIGNED")]
         par += [".%s(%d)" % (k, two(k)) for k in ("TOPOUTPUT_SELECT", "TOPADDSUB_LOWERINPUT", "TOPADDSUB_CARRYSELECT",
                 "BOTOUTPUT_SELECT", "BOTADDSUB_LOWERINPUT", "BOTADDSUB_CARRYSELECT")]
-        one = lambda k: self.pin(name, k, p[k])
-        bus = lambda nm: "{" + ",".join(self.pin(name, "%s[%d]" % (nm, j), p["%s_%d" % (nm, j)]) for j in reversed(range(16))) + "}"
-        ports = [".CLK(%s)" % self.clocked(p["CLK"]), ".CE(%s)" % self.net(p["CE"])]
+        # icetime's cell type gives the arcs; it picks pipelining from A_REG alone, so whether each half's
+        # output is registered comes from the configuration (cells_sim's OUTPUT_SELECT meaning)
+        base = re.sub(r"_(BYPASS|ALL_PIPELINE)$", "", self.rt.inst.get(name, ("SB_MAC16_MUL_U_16X16_BYPASS",))[0])
+        byp, pip = base + "_BYPASS", base + "_ALL_PIPELINE"
+        if not any(k[0] == pip for k in self.rt.arc):
+            pip = "SB_MAC16_MUL_U_16X16_ALL_PIPELINE"
+        regd = lambda sel, m8: sel == 1 or (sel == 2 and m8) or (sel == 3 and c["PIPELINE_16x16_MULT_REG2"])
+        top = regd(two("TOPOUTPUT_SELECT"), c["TOP_8x8_MULT_REG"])
+        bot = regd(two("BOTOUTPUT_SELECT"), c["BOT_8x8_MULT_REG"])
+        comb = {}
+        for (cl, i_, o_), v in self.rt.arc.items():
+            if cl == byp and o_.startswith("O["):
+                comb.setdefault(o_, [0, 0])
+                comb[o_] = [max(comb[o_][0], v[0]), max(comb[o_][1], v[1])]
+        # into a register: the input's worst combinational path to an output stands in for its setup;
+        # with any half combinational the delay sits on the outputs instead
+        into = defaultdict(lambda: [0, 0])
+        if top and bot:
+            for (cl, i_, o_), v in self.rt.arc.items():
+                if cl == byp and o_.startswith("O["):
+                    k = i_
+                    into[k] = [max(into[k][0], v[0]), max(into[k][1], v[1])]
+        pin_d = lambda k: into.get(k, self.rt.setup.get(pip, {}).get(re.sub(r"\[.*", "", k), [0, 0]) if c["A_REG"] else [0, 0])
+        one = lambda k: self.pin(name, k, p[k], *pin_d(k))
+        bus = lambda nm: "{" + ",".join(self.pin(name, "%s[%d]" % (nm, j), p["%s_%d" % (nm, j)], *pin_d("%s[%d]" % (nm, j)))
+                                        for j in reversed(range(16))) + "}"
+        ports = [".CLK(%s)" % self.clkpin(name, "CLK", p["CLK"]), ".CE(%s)" % one("CE")]
         for k in ("AHOLD", "BHOLD", "CHOLD", "DHOLD", "IRSTTOP", "IRSTBOT", "ORSTTOP", "ORSTBOT", "OLOADTOP", "OLOADBOT",
                   "ADDSUBTOP", "ADDSUBBOT", "OHOLDTOP", "OHOLDBOT", "CI"):
             ports.append(".%s(%s)" % (k, one(k)))
         for k in "ABCD":
             ports.append(".%s(%s)" % (k, bus(k)))
-        d = max(max(v) for k, v in self.rt.arc.items() if k[0] == "SB_MAC16_MUL_U_16X16_BYPASS" and k[2].startswith("O["))
         self.o.append("initial begin %s end" % " ".join("m%d.%s = 0;" % (i, r) for r in
                       ("rA", "rB", "rC", "rD", "rF", "rG", "rH", "rJ", "rK", "rQ", "rS")))
         self.o.append("wire [31:0] mo%d; wire mc%d; SB_MAC16 #(%s) m%d(%s,.ACCUMCI(1'b0),.SIGNEXTIN(1'b0),.O(mo%d),.CO(mc%d));" % (
@@ -331,9 +349,11 @@ class TGen:
         for j in range(32):
             a = p["O_%d" % j]
             if a != NO:
-                self.o.append(self.drive("mo%d[%d]" % (i, j), d, d, a))
+                q = self.rt.arc[(pip, "CLK", "O[%d]" % j)] if (top if j >= 16 else bot) else comb["O[%d]" % j]
+                self.o.append(self.drive("mo%d[%d]" % (i, j), q[0], q[1], a))
         if p.get("CO", NO) != NO:
-            self.o.append(self.drive("mc%d" % i, d, d, p["CO"]))
+            q = self.rt.arc[(pip, "CLK", "CO")] if top else self.rt.arc[(byp, "CI", "CO")]
+            self.o.append(self.drive("mc%d" % i, q[0], q[1], p["CO"]))
 
     def ios(self, a):
         n, o, arc = self.n, self.o, self.rt.arc
