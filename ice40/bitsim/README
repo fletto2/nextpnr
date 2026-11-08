@@ -4,6 +4,11 @@ bitsim: run an iCE40 UP5K bitstream directly, two-valued, cycle exact against th
   make ASC=X.asc PCF=vera_module.pcf O=build     (ACT=act.txt optional, see below)
   build/replay EV OUT --clk50 PS [--mem PREFIX Z0,Z1,Z2,Z3]
 
+--mem loads PREFIX0..3 (the RTL banks blk0..3) into SPRAM cells Z0..Z3. Placement decides which cell holds
+which bank (s7 3,2,4,1, nb1 2,3,1,4, casc_s4 3,1,4,2). make writes it to build/memorder: memmap writes one
+byte into each bank over the bus and sees which cell it lands in. A wrong order looks like real video
+mismatches. tgen.py takes the same string as --mem-order.
+
 asc2net.py   .asc -> flat netlist, routing collapsed
 checknet.py  X.net routed.json: every cell at its BEL, config and nets, must equal the routed design
 gen.py       netlist -> bitsim_gen.c + bitsim_pins.h, straight-line levelized C
@@ -26,8 +31,9 @@ A combinational loop becomes a bounded inner loop and gen.py reports it (none in
 clk50 and pll_lock are pins, the PLL is not modelled; clk25 connects to nothing else.
 
 Speed comes from running only what can change: partitions of 16 nodes with dirty flags, FF groups
-and memory ports with an input-moved flag. To order the schedule by activity, gen.py --part 1 --count,
-build with -DBS_COUNT, replay (writes act.txt), then ACT=act.txt. Results do not depend on it.
+and memory ports with an input-moved flag. To order the schedule by activity, PROFILE="EV OUT --clk50 PS"
+counts a replay of any trace on this image first. Results do not depend on it, speed does: net numbers
+are per image, so never reuse an act.txt from another image.
 
 Not modelled, gen.py stops: DDR and registered or latched IO inputs, PLL types other than PAD,
 dynamic SPRAM SLEEP/POWEROFF. WARMBOOT ignored. MAC16 cascade pins read 0 (not in the chipdb).
@@ -78,3 +84,36 @@ with -gs banks above 0 go to RAM first. IRQ is sampled at the end of each instru
 penultimate cycle. HostFS takes no simulated time. spi_miso is held high (no card), SD does not work,
 audio pads are ignored. The screen comes from the VGA pads at 640x480 timing; NTSC and RGB modes don't
 map. x16emu's own VERA stays idle, so the debugger's VERA panes show nothing real.
+
+VERATESTALL TAB counts 88D5 IRQs here and on stock x16emu, 8898 on the OtterX: x16emu's CPU/VIA timing,
+not bitsim (every other line, CRCs included, matches the board).
+
+tmnet.py: routed delays out of an image, from icetime's timing netlist and timings_up5k.txt (min/typ/max).
+
+  icetime -d up5k -P sg48 -p x.pcf -o X.tv X.asc
+  python3 tmnet.py X.asc X.tv [--corner 0|1|2] [--pads REGEX]     pad to FF, pad to pad, strobes to clock pins
+  python3 tmnet.py X.asc X.tv --spi                               spi_sck and spi_mosi at the pads
+
+tgen.py: the same netlist as Verilog with those delays on every cell input, for iverilog against the
+reference traces, checked column by column like replay.
+
+  python3 tgen.py X.net X.tv OUT.v [--corner 0|1|2] [--scale 0]
+  iverilog -g2012 -s tb -o X.vvp OUT.v cells_sim.v
+  vvp -n X.vvp +ev=EV +out=OUT +clk50=PS [+mem=PREFIX] [+stop=PS] [+edge=PS]
+
+--scale 0 drops every delay (the control, run it at +edge=300). A reference sample shows the state after
+the last clk50 rise, at a phase that differs per trace, so a timed run samples +edge=17000 (default) after
+that rise, past the clock to pad delays and before the next edge's. Read data is checked where the CPU
+takes it: the pads as the read strobe ends against the reference's last value in that strobe (the design
+can change it mid-strobe, with delays that reaches the pads later), which makes it a setup check for the
+bus too. Slow: a few microseconds of chip time per second.
+
+Results, s7 and casc_s4, a3/s4/s5/s7/f9 to 2 ms each: zero delay and typ match everywhere. At max, f9
+differs in two ways, both timing and not model errors: a DC_VIDEO write shows one clk later (strobe to clk
+synchronizer), and 6 of 1204 DATA0 reads come back stale. Those are the third of three DATA0 reads whose
+strobes end 121 to 132 ns apart, about 3 clk; at max the fetch needs one clk more. A 65C02 at 12 MHz can't
+read that fast (LDA abs is 4 cycles, 333 ns).
+
+make test: runtime.inc's MAC16 and block RAM against yosys' cells_sim.v on random vectors, async reset pulses
+included, every MAC configuration in the image plus random ones, all 16 RAM mode pairs. SPRAM is not covered:
+cells_sim gives x on a write where the model holds, that assumption rests on the runs against hardware.

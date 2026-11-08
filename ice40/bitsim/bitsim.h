@@ -17,4 +17,5 @@ int  bitsim_get(int pin);               /* pad value after the last eval */
 int  bitsim_driven(int pin);            /* the FPGA drives this pad */
 int  bitsim_contention(void);           /* bidir pads driven from both sides */
 void bitsim_spram_load(int cell, const uint16_t *words, int n);   /* cell = chipdb z, 1..4 */
+int  bitsim_spram_peek(int cell, int addr);                         /* -1 if no such cell */
 #endif
